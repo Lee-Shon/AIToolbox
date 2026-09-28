@@ -1,0 +1,10 @@
+{
+  "component": "llama.cpp",
+  "release": "b10621",
+  "platform": "win-cpu-x64",
+  "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10621/llama-b10621-bin-win-cpu-x64.zip",
+  "sha256": "0e8b65e650e369f70f8307d890508886f171ef4fb00facccddd4a1b7ffdaca51",
+  "bytes": 18068018,
+  "license": "MIT",
+  "license_url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b10621/LICENSE"
+}

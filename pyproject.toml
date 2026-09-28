@@ -1,0 +1,13 @@
+[project]
+name = "aitoolbox-standalone"
+version = "10.2.0"
+description = "Connect user-owned local models and cloud providers through local APIs"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+readme = "README.md"
+dependencies = []
+
+[tool.aitoolbox]
+platform = "Windows x64"
+entrypoint = "src/main.py"
+build = "tools/build.py"
