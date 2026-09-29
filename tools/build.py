@@ -65,7 +65,7 @@ def main():
     for name in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"):
         shutil.copyfile(ROOT / name, destination / name)
     shutil.copytree(ROOT / "licenses", destination / "licenses", dirs_exist_ok=True)
-    manifest = {"version": "10.2.0", "python": sys.version.split()[0], "runtime": json.loads((ROOT / "config/runtime-lock.json").read_text()),
+    manifest = {"version": "10.3.0", "python": sys.version.split()[0], "runtime": json.loads((ROOT / "config/runtime-lock.json").read_text()),
                 "files": {p.relative_to(destination).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in sorted(destination.rglob("*")) if p.is_file() and p.name != "manifest.json"}}
     (destination / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

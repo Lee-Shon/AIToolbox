@@ -32,9 +32,11 @@ from urllib.parse import parse_qs, urlsplit
 import uuid
 import zlib
 
+from .ownership import ProcessJob
+
 
 CAPABILITIES = {"text_input", "image_input", "audio_input", "text_output"}
-VERSION = "10.2.0"
+VERSION = "10.3.0"
 # Execution headroom only. SharedContext gates every generation by the caller's
 # declared quota; this is not a model-registration or per-request context limit.
 NATIVE_SLOTS = 32
@@ -44,7 +46,7 @@ RETRYABLE_REGISTRATION_ERRORS = {
     "runtime_load_timeout",
     "system_memory_status_unavailable", "runtime_memory_estimate_failed",
     "insufficient_free_system_memory", "audio_validation_requires_windows_english_speech_voice",
-    "validation_interrupted_by_restart",
+    "validation_interrupted_by_restart", "service_stopping", "validation_worker_start_failed",
 }
 
 
@@ -121,6 +123,7 @@ class Runtime:
         self.lifecycle = threading.RLock()
         self.lock = threading.RLock()
         self.inflight = 0
+        self.job: ProcessJob | None = None
 
     def stop(self) -> None:
         with self.lifecycle:
@@ -130,6 +133,9 @@ class Runtime:
                         break
                 time.sleep(0.1)
             with self.lock:
+                if self.job is not None:
+                    self.job.close()
+                    self.job = None
                 if self.process is not None:
                     self.process.terminate()
                     try:
@@ -145,6 +151,20 @@ class Runtime:
                 self.binding = None
                 self.capacity = {}
                 self.pool = None
+
+    def release(self, model_id: str, started: bool) -> None:
+        # Drain waiters hold lifecycle while waiting for inflight. Decrement
+        # before taking that lock, or the last completion would deadlock.
+        with self.lock:
+            if started:
+                self.inflight -= 1
+            if self.inflight:
+                return
+        with self.lifecycle:
+            with self.lock:
+                # A waiting switch/new call may have acquired the runtime first.
+                if not self.inflight and self.model_id == model_id:
+                    self.stop()
 
     def _check_memory(self, row: dict, total_context: int, parallel: int) -> None:
         estimator = self.executable.with_name("llama-fit-params.exe")
@@ -179,6 +199,16 @@ class Runtime:
 
     def start(self, row: dict) -> int:
         with self.lifecycle:
+            try:
+                return self._start(row)
+            except BaseException:
+                # Covers Popen, malformed health/capacity responses and I/O
+                # failures as well as the expected load/validation errors.
+                self.stop()
+                raise
+
+    def _start(self, row: dict) -> int:
+        with self.lifecycle:
             binding = (row["id"], row["revision"], row["max_context_tokens"])
             if self.binding == binding and self.process is not None and self.process.poll() is None:
                 return int(self.port)
@@ -210,8 +240,10 @@ class Runtime:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             self.log = log_path.open("ab")
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.job = ProcessJob()
             self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=self.log,
                                             stderr=subprocess.STDOUT, creationflags=flags)
+            self.job.assign(self.process)
             self.port, self.model_id, self.binding = port, row["id"], binding
             until = time.monotonic() + 240
             while time.monotonic() < until:
@@ -348,6 +380,8 @@ class Product:
         self.lock = threading.RLock()
         self.idle = threading.Condition(self.lock)
         self.request_counts: dict[tuple[str, int], int] = {}
+        self.closing = False
+        self.workers: set[threading.Thread] = set()
         self.runtime = Runtime(executable, root)
         self.rows = json.loads(self.registry_path.read_text(encoding="utf-8")) if self.registry_path.exists() else {}
         # A restarted relay cannot prove what an interrupted native call did.
@@ -370,6 +404,31 @@ class Product:
                 row.update(state="REJECTED", error="validation_interrupted_by_restart",
                            updated_at=time.time())
         self._save()
+
+    def _launch(self, target, args) -> None:
+        # Caller holds the registry lock, making acceptance and worker tracking
+        # atomic with close(). Validation itself must not hold that lock.
+        def work():
+            try:
+                target(*args)
+            finally:
+                with self.idle:
+                    self.workers.discard(worker)
+                    self.idle.notify_all()
+        worker = threading.Thread(target=work, daemon=True)
+        self.workers.add(worker)
+        try:
+            worker.start()
+        except BaseException:
+            self.workers.discard(worker)
+            raise
+
+    def close(self) -> None:
+        with self.idle:
+            self.closing = True
+            while self.request_counts or self.workers:
+                self.idle.wait()
+        self.runtime.stop()
 
     def _save(self) -> None:
         save_json(self.registry_path, self.rows)
@@ -416,6 +475,8 @@ class Product:
         spec = self.registration_spec(body)
         model_id = spec["id"]
         with self.lock:
+            if self.closing:
+                raise ProductError("service_stopping", 503)
             prior = self.rows.get(model_id)
             if prior and prior["state"] != "REMOVED":
                 if prior["state"] in {"UPDATING", "DRAINING"}:
@@ -433,7 +494,12 @@ class Product:
                    "assets": {}, "checked": {}, "error": None, "updated_at": time.time()}
             self.rows[model_id] = row
             self._save()
-        threading.Thread(target=self._validate, args=(model_id,), daemon=True).start()
+            try:
+                self._launch(self._validate, (model_id,))
+            except Exception as exc:
+                row.update(state="REJECTED", error="validation_worker_start_failed")
+                self._save()
+                raise ProductError("validation_worker_start_failed", 503) from exc
         return 202, row.copy()
 
     def _validate(self, model_id: str) -> None:
@@ -457,6 +523,8 @@ class Product:
             row["assets"] = assets
             with self.runtime.lifecycle:
                 try:
+                    if self.closing:
+                        raise ProductError("service_stopping", 503)
                     self.runtime.start(row)
                     checked = probe(int(self.runtime.port), row)
                     if set(row["capabilities"]) != set(checked):
@@ -478,6 +546,8 @@ class Product:
         if not isinstance(body, dict) or not fields.intersection(body) or set(body) - fields - {"expected_revision"}:
             raise ProductError("invalid_model_update")
         with self.lock:
+            if self.closing:
+                raise ProductError("service_stopping", 503)
             row = self.rows.get(model_id)
             if row is None or row["state"] == "REMOVED":
                 raise ProductError("model_not_found", 404)
@@ -500,7 +570,15 @@ class Product:
             row["pending_update"] = {"spec": spec, "revision": revision, "previous_state": row["state"]}
             row.update(state="UPDATING", update_error=None, updated_at=time.time())
             self._save()
-        threading.Thread(target=self._apply_update, args=(model_id, revision), daemon=True).start()
+            try:
+                self._launch(self._apply_update, (model_id, revision))
+            except Exception as exc:
+                pending = row.pop("pending_update")
+                row.update(state=pending["previous_state"], update_error="validation_worker_start_failed",
+                           last_update={"state": "REJECTED", "revision": revision,
+                                        "error": "validation_worker_start_failed"})
+                self._save()
+                raise ProductError("validation_worker_start_failed", 503) from exc
         return 202, self.get(model_id)
 
     def _apply_update(self, model_id: str, revision: int) -> None:
@@ -797,6 +875,8 @@ class Handler(BaseHTTPRequestHandler):
             # An update must drain all accepted calls, including ones that
             # have not yet entered the native runtime.
             with p.lock:
+                if p.closing:
+                    raise ProductError("service_stopping", 503)
                 current = p.get(model_id)
                 if current["revision"] != row["revision"]:
                     raise ProductError("model_binding_changed", 409)
@@ -964,12 +1044,14 @@ class Handler(BaseHTTPRequestHandler):
                 save_json(record_path, record)
             finally:
                 # A disk error must not permanently pin the runtime as busy.
-                if reservation:
-                    pool.release(reservation)
-                if started:
-                    with p.runtime.lock:
-                        p.runtime.inflight -= 1
-                p.release_request(row)
+                try:
+                    if reservation:
+                        pool.release(reservation)
+                finally:
+                    try:
+                        p.runtime.release(model_id, started)
+                    finally:
+                        p.release_request(row)
         if not is_stream:
             send_headers()
             forward(response_body)

@@ -268,7 +268,7 @@ class Application:
             while self.active:
                 self.requests.wait(timeout=.2)
         if self.product is not None:
-            self.product.runtime.stop()
+            self.product.close()
         for server in reversed(self.servers[1:]):
             server.server_close()
         if self.servers:

@@ -20,6 +20,7 @@ from local_product import service
 
 
 class FakeRuntime:
+    release = service.Runtime.release
     def __init__(self, port=0):
         self.port = port
         self.lock = threading.RLock()
@@ -68,12 +69,12 @@ class Native(BaseHTTPRequestHandler):
         self.server.payload = json.loads(body) if self.headers['Content-Type'].startswith('application/json') else body
         self.server.generations.append(body)
         self.server.entered.set()
-        self.send_response(200)
         mode = self.server.mode
-        self.send_header('Content-Type', 'text/event-stream' if mode != 'json' else 'application/json')
+        self.send_response(500 if mode == 'error' else 200)
+        self.send_header('Content-Type', 'application/json' if mode in ('json', 'error') else 'text/event-stream')
         self.end_headers()
         try:
-            if mode == 'json':
+            if mode in ('json', 'error'):
                 self.wfile.write(b'{"choices":[{"message":{"content":"working"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}')
                 return
             self.wfile.write(b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n')
@@ -149,6 +150,155 @@ class Regressions(unittest.TestCase):
 
     def receipt(self, request_id='request'):
         return json.loads((self.root / 'requests' / (request_id + '.json')).read_text())
+
+    def test_worker_launch_failure_is_retryable_and_update_rolls_back(self):
+        with patch.object(service.threading.Thread, 'start', side_effect=OSError('cannot start worker')):
+            with self.assertRaises(service.ProductError):
+                self.product.register(self.spec)
+        self.assertEqual(self.product.get('model')['state'], 'REJECTED')
+        self.assertFalse(self.product.workers)
+        with patch.object(service.threading, 'Thread', ImmediateThread), patch.object(service, 'probe',
+                return_value={'text_input': {}, 'text_output': {}}):
+            self.product.register(self.spec)
+        self.assertEqual(self.product.get('model')['state'], 'READY')
+        with patch.object(service.threading.Thread, 'start', side_effect=OSError('cannot start worker')):
+            with self.assertRaises(service.ProductError):
+                self.product.update('model', {'max_context_tokens': 16384})
+        row = self.product.get('model')
+        self.assertEqual(row['state'], 'READY')
+        self.assertEqual(row['max_context_tokens'], 8192)
+        self.assertEqual(row['update_error'], 'validation_worker_start_failed')
+        self.assertFalse(self.product.workers)
+
+    def test_validation_waiting_at_shutdown_does_not_load_and_can_retry(self):
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with self.product.runtime.lifecycle:
+                self.product.register(self.spec)
+                closing = workers.submit(self.product.close)
+                until = time.monotonic() + 2
+                while not self.product.closing and time.monotonic() < until:
+                    time.sleep(.01)
+                self.assertTrue(self.product.closing)
+            closing.result(timeout=3)
+        self.assertEqual(self.product.get('model')['error'], 'service_stopping')
+        self.assertIsNone(self.product.runtime.model_id)
+        token = self.product.data_admin_token_file
+        self.product = service.Product(self.root, Path(sys.executable), 'http://127.0.0.1:49011', token)
+        self.product.runtime = FakeRuntime()
+        with patch.object(service.threading, 'Thread', ImmediateThread), patch.object(service, 'probe',
+                return_value={'text_input': {}, 'text_output': {}}):
+            self.product.register(self.spec)
+        self.assertEqual(self.product.get('model')['state'], 'READY')
+
+    def test_close_waits_for_active_validation_and_prevents_future_load(self):
+        entered, finish = threading.Event(), threading.Event()
+        def probing(*args):
+            entered.set()
+            if not finish.wait(3):
+                raise TimeoutError('validation gate')
+            return {'text_input': {}, 'text_output': {}}
+        with patch.object(service, 'probe', side_effect=probing), ThreadPoolExecutor(max_workers=1) as workers:
+            self.product.register(self.spec)
+            self.assertTrue(entered.wait(2))
+            closing = workers.submit(self.product.close)
+            try:
+                time.sleep(.05)
+                self.assertFalse(closing.done())
+                with self.assertRaises(service.ProductError) as denied:
+                    self.product.register(dict(self.spec, id='another'))
+                self.assertEqual(denied.exception.code, 'service_stopping')
+            finally:
+                finish.set()
+            closing.result(timeout=3)
+        self.assertFalse(self.product.workers)
+        self.assertIsNone(self.product.runtime.model_id)
+
+    def test_close_drains_active_response_and_rejects_new_requests(self):
+        self.ready()
+        with self.native('gated') as native, ThreadPoolExecutor(max_workers=2) as workers:
+            active = workers.submit(self.handler(stream=True)._proxy, '/v1/chat/completions')
+            self.assertTrue(native.entered.wait(2))
+            closing = workers.submit(self.product.close)
+            try:
+                time.sleep(.05)
+                self.assertFalse(closing.done())
+                with self.assertRaises(service.ProductError) as denied:
+                    self.handler(request_id='late')._proxy('/v1/chat/completions')
+                self.assertEqual(denied.exception.code, 'service_stopping')
+                self.assertEqual(self.product.runtime.model_id, 'model')
+            finally:
+                native.release.set()
+            active.result(timeout=3)
+            closing.result(timeout=3)
+        self.assertEqual(self.receipt()['state'], 'COMPLETED')
+        self.assertIsNone(self.product.runtime.model_id)
+        self.assertFalse(self.product.request_counts)
+
+    def test_stream_failure_disconnect_and_success_all_release(self):
+        self.ready()
+        for mode, broken in (('json', False), ('stream', False), ('truncated', False), ('stream', True)):
+            with self.subTest(mode=mode, broken=broken), self.native(mode):
+                rid = mode + str(broken)
+                self.handler(request_id=rid, stream=True, broken_client=broken)._proxy('/v1/chat/completions')
+                self.assertIsNone(self.product.runtime.model_id)
+                self.assertEqual(self.product.runtime.inflight, 0)
+                self.assertFalse(self.product.request_counts)
+                self.assertEqual(self.receipt(rid)['state'], 'UNKNOWN' if mode == 'truncated' else 'COMPLETED')
+
+    def test_load_unexpected_failure_and_spawn_failure_close_resources(self):
+        self.ready()
+        row = self.product.get('model')
+        asset = Path(row['model_path'])
+        row['assets'] = {'model_path': {'size': asset.stat().st_size,
+            'mtime_ns': asset.stat().st_mtime_ns, 'sha256': service.digest(asset)}}
+        for spawn_failure in (False, True):
+            with self.subTest(spawn_failure=spawn_failure):
+                runtime = service.Runtime(Path(sys.executable), self.root)
+                with patch.object(runtime, '_check_memory'), patch.object(service, 'ProcessJob') as job, patch.object(
+                        service.subprocess, 'Popen') as process, patch.object(service, 'urlopen', side_effect=ValueError('bad native response')):
+                    process.return_value.poll.return_value = None
+                    if spawn_failure:
+                        process.side_effect = OSError('launch denied')
+                    with self.assertRaises((ValueError, OSError)):
+                        runtime.start(row)
+                    self.assertIsNone(runtime.process)
+                    self.assertIsNone(runtime.log)
+                    self.assertIsNone(runtime.job)
+                    job.return_value.close.assert_called_once()
+                    if not spawn_failure:
+                        process.return_value.wait.assert_called()
+
+    def test_native_error_preserves_failed_receipt_and_releases(self):
+        self.ready()
+        with self.native('error'):
+            self.handler()._proxy('/v1/chat/completions')
+        receipt = self.receipt()
+        self.assertEqual(receipt['state'], 'FAILED')
+        self.assertEqual(receipt['response']['status'], 500)
+        self.assertIsNone(self.product.runtime.model_id)
+        self.assertFalse(self.product.request_counts)
+
+    def test_last_call_releases_model_and_later_call_reloads(self):
+        self.ready()
+        with self.native('json'):
+            for rid in ('first-idle', 'second-reload'):
+                self.handler(request_id=rid)._proxy('/v1/chat/completions')
+                self.assertEqual(self.receipt(rid)['state'], 'COMPLETED')
+                self.assertIsNone(self.product.runtime.model_id)
+                self.assertEqual(self.product.runtime.inflight, 0)
+                self.assertEqual(self.product.get('model')['state'], 'READY')
+
+    def test_invalid_input_after_load_also_releases_model(self):
+        self.ready()
+        with self.native('json'):
+            handler = self.handler()
+            payload = json.loads(handler._body())
+            payload['context_tokens'] = 1
+            handler._body = lambda: json.dumps(payload).encode()
+            with self.assertRaises(service.ProductError):
+                handler._proxy('/v1/chat/completions')
+        self.assertIsNone(self.product.runtime.model_id)
+        self.assertFalse(self.product.request_counts)
 
     def test_retry_transient_registration_failure_same_binding(self):
         self.product.runtime.error = 'insufficient_free_system_memory'
@@ -407,7 +557,7 @@ class Regressions(unittest.TestCase):
                     self.assertIsNone(runtime.model_id)
                 else:
                     self.assertEqual(self.receipt('other')['state'], 'COMPLETED')
-                    self.assertEqual(runtime.model_id, 'other')
+                    self.assertIsNone(runtime.model_id)
 
     def test_concurrent_duplicate_request_id_runs_native_once(self):
         self.ready()
@@ -479,6 +629,7 @@ class Regressions(unittest.TestCase):
             with self.assertRaises(OSError):
                 handler._proxy('/v1/chat/completions')
         self.assertEqual(self.product.runtime.inflight, 0)
+        self.assertIsNone(self.product.runtime.model_id)
         self.assertEqual(handler.wfile.getvalue(), b'')
 
     def test_stream_save_failure_does_not_publish_done_or_pin_runtime(self):
@@ -490,6 +641,7 @@ class Regressions(unittest.TestCase):
         self.assertIn(b'hello', handler.wfile.getvalue())
         self.assertNotIn(b'[DONE]', handler.wfile.getvalue())
         self.assertEqual(self.product.runtime.inflight, 0)
+        self.assertIsNone(self.product.runtime.model_id)
 
     def test_non_stream_result_saved_before_response(self):
         self.ready()
@@ -641,7 +793,7 @@ class Regressions(unittest.TestCase):
             result = io.BytesIO(json.dumps(data).encode())
             result.status = 200
             return result
-        with patch.object(runtime, '_check_memory') as memory, patch.object(service.subprocess, 'Popen') as process, patch.object(
+        with patch.object(runtime, '_check_memory') as memory, patch.object(service, 'ProcessJob'), patch.object(service.subprocess, 'Popen') as process, patch.object(
                 service, 'urlopen', side_effect=response):
             process.return_value.poll.return_value = None
             try:
@@ -811,7 +963,7 @@ class Regressions(unittest.TestCase):
             result = io.BytesIO(json.dumps(data).encode())
             result.status = 200
             return result
-        with patch.object(runtime, '_check_memory'), patch.object(service.subprocess, 'Popen') as process, patch.object(
+        with patch.object(runtime, '_check_memory'), patch.object(service, 'ProcessJob'), patch.object(service.subprocess, 'Popen') as process, patch.object(
                 service, 'urlopen', side_effect=response):
             process.return_value.poll.return_value = None
             with self.assertRaises(service.ProductError) as caught:
