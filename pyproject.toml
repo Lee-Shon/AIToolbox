@@ -1,6 +1,6 @@
 [project]
 name = "aitoolbox-standalone"
-version = "11.8.0"
+version = "11.15.0"
 description = "Connect user-owned local models and cloud providers through local APIs"
 requires-python = ">=3.11"
 license = { text = "MIT" }

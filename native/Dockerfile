@@ -73,4 +73,4 @@ RUN cd /backends/cuda12-llama-cpp/lib && sha256sum libllama.so libllama-common.s
 RUN cp /opt/aitoolbox-contract/llama-cpp-contract /backends/cuda12-llama-cpp/llama-cpp-cpu-all && cp /opt/aitoolbox-contract/llama-cpp-contract /backends/cuda12-llama-cpp/llama-cpp-grpc
 LABEL org.aitoolbox.call-contract="native-preparation-v1"
 
-LABEL org.aitoolbox.standalone="11.8.0"
+LABEL org.aitoolbox.standalone="11.15.0"

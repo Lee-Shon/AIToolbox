@@ -2,7 +2,11 @@
 
 把自己的本地模型和云厂商接成 API，保存结果、原请求身份与用量。首次启动没有预置厂商、模型或账号；模型文件、账号和密钥由使用者提供。
 
-**当前版本 11.8.0，直接迁入主线 v11.7.0 已完成的升级。** 本地服务、两层资源安排、批次连续段停止、LocalAI 原生扩展沿用该版本；独立版保留自己的窗口、云厂商配置、凭据、数据库和端口。旧 v10.3.0 CPU 版可从 Git 历史恢复。
+**当前源码版本 11.15.0，保留 v11.7.0 的 LocalAI 升级，并同步主线 v11.13.0 的请求与取消修复。** 本地服务、两层资源安排、批次连续段停止、LocalAI 原生扩展沿用该版本；独立版保留自己的窗口、云厂商配置、凭据、数据库和端口。旧 v10.3.0 CPU 版可从 Git 历史恢复。
+
+11.15.0 修复不完整请求仍执行、提交前错误状态、流式结束标记误判，以及 vLLM 取消后的迟到提交和响应超时。部分结果、原请求身份和真实停止证明继续保存。此版本发布源码，Windows 二进制未更新；ComfyUI 由独立项目维护。
+
+后端扩展也有修改，须准备包含当前 `native/extensions/backend/python/vllm_execution.py` 的 11.15.0 镜像。现有 11.8.0 镜像不会自动更新；先关闭应用并排空请求，运行 `tools/localai.py stop`，移除该工具准确提示的自有旧容器，再以 `tools/localai.py start --image aitoolbox-localai:11.15.0` 启动，沿用原数据目录和模型根。数据和权重保留在宿主机。
 
 ## 运行环境与启动
 
@@ -15,16 +19,16 @@ Windows 10/11 x64；桌面源码使用 Python 3.11 和 Tk。**本地模型运行
 
    ```bash
    python3 /path/to/AIToolbox/tools/prepare_backend.py --output "$HOME/aitoolbox-build"
-   docker build -t aitoolbox-localai:11.8.0 "$HOME/aitoolbox-build"
+   docker build -t aitoolbox-localai:11.15.0 "$HOME/aitoolbox-build"
    ```
 
-   **已有 V11.7 部署可直接迁移，跳过上述从零构建：**
+   **已有匹配当前 helper 的 V11 部署可迁移，跳过上述从零构建：**
 
    ```bash
    python3 /path/to/AIToolbox/tools/migrate_backend.py --backends /your/existing/backends
    ```
 
-   默认读取已验证镜像 `aitoolbox-localai:v4.10.0-contract-v4`，也可用 `--source-image` 指定。工具核对适配器后，将原镜像与两个已安装后端完整复制进独立镜像，不重新编译、不修改旧后端，也不复制模型、配置、凭据或数据卷。独立容器自带 `/backends/cuda12-llama-cpp` 和 `/backends/cuda13-vllm`，运行时不依赖旧部署的后端目录。固定来源见 `config/runtime-lock.json`。
+   工具先核对已安装 helper 与当前源码完全相同；旧 helper 不匹配时明确拒绝，须先更新它或使用上述从零准备方法。默认读取已验证镜像 `aitoolbox-localai:v4.10.0-contract-v4`，也可用 `--source-image` 指定。工具核对适配器后，将原镜像与两个已安装后端完整复制进独立镜像，不重新编译、不修改旧后端，也不复制模型、配置、凭据或数据卷。独立容器自带 `/backends/cuda12-llama-cpp` 和 `/backends/cuda13-vllm`，运行时不依赖旧部署的后端目录。固定来源见 `config/runtime-lock.json`。
 
 3. 回到 Windows，在仓库目录中建立自己的后端。`--asset-root` 可重复指定，目录中的文件只读挂载；登记模型时选择这些目录内的文件或模型目录。省略时使用数据目录下的 `models`。
 

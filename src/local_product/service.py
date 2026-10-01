@@ -391,7 +391,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ProductError("invalid_content_length") from exc
         if not 0 < length <= MAX_BODY:
             raise ProductError("invalid_body_size", 413)
-        return self.rfile.read(length)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ProductError("incomplete_request_body")
+        return body
 
     def _handle(self) -> None:
         path = self.path.split("?", 1)[0]

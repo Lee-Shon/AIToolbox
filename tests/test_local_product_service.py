@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import socket
 from pathlib import Path
 import tempfile
 import threading
@@ -91,14 +92,20 @@ class Backend(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "10000")
         self.end_headers()
         if stream:
-            self.wfile.write(b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n')
+            content = "data: [DONE]" if mode == "marker_truncated" else "hello"
+            self.wfile.write(("data: " + json.dumps({"choices": [{"delta": {
+                "content": content}}]}) + "\n\n").encode())
             self.wfile.flush()
         if mode == "gated":
             self.server.release.wait(3)
         usage = {"prompt_tokens": 3, "completion_tokens": 2}
         if stream:
             self.wfile.write(("data: " + json.dumps({"choices": [], "usage": usage}) + "\n\n").encode())
-            if mode not in {"truncated", "broken"}:
+            if mode == "done_truncated":
+                self.wfile.write(b"data: [DONE]\n")
+            elif mode == "crlf_stream":
+                self.wfile.write(b"data: [DONE]\r\n\r\n")
+            elif mode not in {"truncated", "broken", "marker_truncated"}:
                 self.wfile.write(b"data: [DONE]\n\n")
         else:
             self.wfile.write(json.dumps({"choices": [{"message": {"content": "hello"}}], "usage": usage}).encode())
@@ -224,6 +231,85 @@ class Regressions(unittest.TestCase):
         self.assertEqual(receipt["capacity"]["input_tokens"], 37)
         self.assertEqual(receipt["capacity"]["reserved_context_tokens"], 53)
         self.assertEqual(receipt["state"], "COMPLETED")
+
+    def test_stream_content_cannot_impersonate_terminal_event(self):
+        with self.backend("marker_truncated") as backend:
+            self.call(self.handler(stream=True))
+        receipt = self.receipt()
+        self.assertEqual(receipt["state"], "UNKNOWN")
+        self.assertEqual(receipt["error"], "localai_stream_incomplete")
+        self.assertIn(b"data: [DONE]", base64.b64decode(receipt["response"]["body_base64"]))
+        self.assertEqual(len(backend.generations), 1)
+        self.assertEqual(self.product.request_counts, {})
+        self.assertEqual(self.product.runtime.placement.instances, [])
+
+    def test_stream_requires_a_complete_terminal_event(self):
+        with self.backend("done_truncated"):
+            self.call(self.handler(stream=True))
+        self.assertEqual(self.receipt()["state"], "UNKNOWN")
+
+    def test_stream_accepts_crlf_terminal_event(self):
+        with self.backend("crlf_stream"):
+            self.call(self.handler(stream=True))
+        self.assertEqual(self.receipt()["state"], "COMPLETED")
+
+    def test_presend_receipt_failure_is_known_not_submitted(self):
+        persist = v11.save_json
+        failed = []
+        def fail_once(path, record):
+            if record.get("execution_started_at") and not failed:
+                failed.append(True)
+                raise OSError("presend disk failure")
+            persist(path, record)
+        with self.backend() as backend, patch.object(v11, "save_json", side_effect=fail_once):
+            with self.assertRaisesRegex(OSError, "presend disk failure"):
+                self.call()
+        receipt = self.receipt()
+        self.assertEqual(receipt["state"], "FAILED")
+        self.assertIsNone(receipt["response"])
+        self.assertEqual(backend.generations, [])
+        self.assertEqual([call["metadata"]["aitoolbox_phase"] for call in backend.calls],
+                         ["prepare", "discard"])
+        self.assertEqual(self.product.request_counts, {})
+        self.assertEqual(self.product.runtime.placement.instances, [])
+
+    def test_incomplete_http_body_never_accepts_or_generates(self):
+        from local_product.service import Server
+        relay = Server(("127.0.0.1", 0), self.product, v11.V11Handler)
+        worker = threading.Thread(target=relay.serve_forever,
+            kwargs={"poll_interval": .01}, daemon=True)
+        worker.start()
+        raw = self.handler()._body()
+        try:
+            with self.backend() as backend, socket.create_connection(relay.server_address, timeout=3) as client:
+                headers = ("POST /v1/chat/completions HTTP/1.0\r\n"
+                    "Authorization: Bearer " + self.product.token + "\r\n"
+                    "Content-Type: application/json\r\nX-Request-ID: incomplete\r\n"
+                    f"Content-Length: {len(raw)+10}\r\n\r\n").encode()
+                client.sendall(headers + raw)
+                client.shutdown(socket.SHUT_WR)
+                with client.makefile("rb") as incoming:
+                    response = incoming.read()
+                self.assertIn(b"400 Bad Request", response)
+                self.assertIn(b"incomplete_request_body", response)
+                self.assertEqual(backend.calls, [])
+                self.assertFalse((self.product.root / "requests" / "incomplete.json").exists())
+                self.assertEqual(self.product.request_counts, {})
+        finally:
+            relay.shutdown()
+            relay.server_close()
+            worker.join(3)
+
+    def test_presend_credential_failure_is_known_not_submitted(self):
+        with self.backend() as backend, patch.object(self.client, "_key", side_effect=[
+                "k" * 40, OSError("presend credential failure"), "k" * 40]):
+            with self.assertRaisesRegex(OSError, "presend credential failure"):
+                self.call()
+        self.assertEqual(self.receipt()["state"], "FAILED")
+        self.assertIsNone(self.receipt()["response"])
+        self.assertEqual(backend.generations, [])
+        self.assertEqual(self.product.request_counts, {})
+        self.assertEqual(self.product.runtime.placement.instances, [])
 
     def test_native_count_over_quota_never_sends_generation(self):
         self.native_row()
@@ -465,9 +551,15 @@ class Regressions(unittest.TestCase):
 
     def test_result_save_failure_does_not_publish_done_or_pin_model(self):
         h = self.handler(stream=True)
-        with self.backend(), patch.object(v11, "save_json", side_effect=OSError("disk full")):
+        persist = v11.save_json
+        def fail_terminal(path, record):
+            if record["state"] == "COMPLETED":
+                raise OSError("disk full")
+            persist(path, record)
+        with self.backend() as backend, patch.object(v11, "save_json", side_effect=fail_terminal):
             with self.assertRaises(OSError):
                 self.call(h)
+            self.assertEqual(len(backend.generations), 1)
         self.assertNotIn(b"[DONE]", h.wfile.getvalue())
         self.assertFalse(self.product.request_counts)
         self.assertIsNone(self.product.runtime.model_id)

@@ -841,7 +841,7 @@ class V11Handler(Handler):
         if self.path.split("?", 1)[0] == "/health" and self.command == "GET":
             self.server.product.client.request("GET", "/v1/models", timeout=5)
             return self._send(200, {"status": "ok", "component": "v11-localai-product",
-                                    "version": "11.8.0"})
+                                    "version": "11.15.0"})
         path = self.path.split('?', 1)[0]
         if path == '/v1/batches' and self.command == 'POST':
             self._auth()
@@ -1120,13 +1120,13 @@ class V11Handler(Handler):
                 raise ProductError('request_cancelled', 409)
             upstream = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
             conn = HTTPConnection("127.0.0.1", p.client.port, timeout=360)
-            request_sent = True
             record['execution_started_at'] = time.time()
             with p.lock:
                 save_json(record_path, record)
-            conn.request("POST", "/v1/chat/completions", upstream, {
-                "Authorization": "Bearer " + p.client._key(),
-                "Content-Type": "application/json", "Content-Length": str(len(upstream))})
+            upstream_headers = {"Authorization": "Bearer " + p.client._key(),
+                "Content-Type": "application/json", "Content-Length": str(len(upstream))}
+            request_sent = True
+            conn.request("POST", "/v1/chat/completions", upstream, upstream_headers)
             response = conn.getresponse()
             is_stream = upstream_stream and response.getheader("Content-Type", "").split(";", 1)[0] == "text/event-stream"
             if is_stream:
@@ -1176,7 +1176,7 @@ class V11Handler(Handler):
                     record.update(state='CANCELLED' if native.get('stop_confirmed') else 'UNKNOWN',
                                   error='original_segment_failure')
                     record['stop_proof'] = native
-            if is_stream and b"data: [DONE]" not in upstream_body:
+            if is_stream and not re.search(rb'(?:^|\n)data:[ \t]*\[DONE\]\r?\n\r?\n', upstream_body):
                 record.update(state="UNKNOWN", error="localai_stream_incomplete")
         except Exception as exc:
             record.update(state="UNKNOWN" if request_sent else "FAILED", error=str(exc))

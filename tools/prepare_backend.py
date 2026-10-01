@@ -1,6 +1,6 @@
 """Prepare the existing V11 native build with pinned public upstream sources.
 
-Run with Python 3.11+ in WSL, then docker build -t aitoolbox-localai:11.8.0 OUTPUT.
+Run with Python 3.11+ in WSL, then docker build -t aitoolbox-localai:11.15.0 OUTPUT.
 No old AIToolbox checkout, installed backend or model files are required.
 """
 import argparse

@@ -59,7 +59,7 @@ def run(args, root):
     settings = json.loads(path.read_text('utf-8')) if path.exists() else dict(cloud_port=49777, local_port=49778)
     saved = settings.get('localai', {})
     distro = args.distribution or saved.get('distribution', 'Ubuntu')
-    image = args.image or saved.get('image', 'aitoolbox-localai:11.8.0')
+    image = args.image or saved.get('image', 'aitoolbox-localai:11.15.0')
     port = args.port if args.port is not None else saved.get('port', 49779)
     if not 1 <= port <= 65535 or port in [settings['cloud_port'], settings['local_port']]:
         raise ValueError('LocalAI port must be distinct from the client API ports')

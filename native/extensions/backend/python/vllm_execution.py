@@ -5,6 +5,7 @@ pool waits between prepare and execute; discard ends the preparation lifetime.
 No generation, retry, durable queue, or second quota pool is hidden in prepare.
 """
 from dataclasses import dataclass, field
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -33,6 +34,8 @@ class PreparedInput:
     output_limit: int = 0
     cancelled: bool = False
     native_executions: dict = field(default_factory=dict)
+    generation_tasks: dict = field(default_factory=dict)
+    cancel_complete: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 def execution_status(entry):
@@ -235,18 +238,31 @@ async def resolve_input(backend, request):
                 return None, dict(execution_status(entry), already_finished=True)
             entry.cancelled = True
             ids = [item['native_request_id'] for item in entry.native_executions.values() if not item['finished']]
-            if ids:
-                # Both messages travel through the same EngineCore input queue.
-                # Its ABORT handler removes only these scheduler requests;
-                # the following worker barrier confirms prior GPU work ended.
-                await backend.llm.abort(ids)
-                proof = await backend.llm.engine_core.collective_rpc_async('aitoolbox_gpu_barrier', timeout=30)
-                if not proof or not all(item.get('device_barrier_completed') for item in proof):
-                    raise ValueError('native_stop_unconfirmed')
-                for item in entry.native_executions.values():
-                    if item['native_request_id'] in ids:
-                        item.update(finished=True, finish_reason='abort', stopped_at=time.time(),
-                                    engine_abort_confirmed=True)
+            try:
+                if ids:
+                    # Stop a producer awaiting add_request before acknowledging
+                    # the abort, so it cannot enqueue AFTER the stop proof.
+                    handles = [(key, entry.generation_tasks[key]) for key in ids if key in entry.generation_tasks]
+                    for key, task in handles:
+                        if not task.done() and not entry.native_executions[key].get('producer_cancel_requested'):
+                            entry.native_executions[key]['producer_cancel_requested'] = True
+                            task.cancel()
+                    if handles:
+                        await asyncio.wait_for(asyncio.gather(*(task for _, task in handles),
+                                                             return_exceptions=True), 30)
+                    # Both messages travel through the EngineCore input queue.
+                    # ABORT removes only these requests; the following worker
+                    # barrier confirms prior GPU work ended.
+                    await backend.llm.abort(ids)
+                    proof = await backend.llm.engine_core.collective_rpc_async('aitoolbox_gpu_barrier', timeout=30)
+                    if not proof or not all(item.get('device_barrier_completed') for item in proof):
+                        raise ValueError('native_stop_unconfirmed')
+                    for item in entry.native_executions.values():
+                        if item['native_request_id'] in ids:
+                            item.update(finished=True, finish_reason='abort', stopped_at=time.time(),
+                                        engine_abort_confirmed=True)
+            finally:
+                entry.cancel_complete.set()
         status = execution_status(entry)
         status['native_context_tokens'] = backend.llm.model_config.max_model_len
         status['precision'] = str(backend.llm.model_config.dtype)
@@ -286,14 +302,30 @@ async def resolve_input(backend, request):
 async def generate_prepared(backend, entry, sampling_params):
     # EngineInput is already tokenized and multimodal-processed. AsyncLLM
     # explicitly accepts it without rendering or applying the template again.
+    if entry.cancelled:
+        raise ValueError('prepared_input_cancelled')
     native_id = 'ait-' + (entry.request_id or random_uuid()) + '-' + str(entry.executions)
     status = {'native_request_id': native_id, 'started_at': time.time(), 'finished': False,
               'output_tokens': 0, 'finish_reason': None}
     entry.native_executions[native_id] = status
-    outputs = backend.llm.generate(entry.engine_input, sampling_params=sampling_params,
-                                   request_id=native_id)
+    outputs = None
+    stopped_by_control = False
     try:
-        async for output in outputs:
+        outputs = backend.llm.generate(entry.engine_input, sampling_params=sampling_params,
+                                       request_id=native_id)
+        while True:
+            if entry.cancelled:
+                stopped_by_control = True
+                break
+            # Own only the native iterator step, never the Predict RPC task.
+            # Cancellation between streamed replies also cannot abandon its
+            # gRPC/HTTP caller or submit another native step after the proof.
+            task = asyncio.create_task(outputs.__anext__())
+            entry.generation_tasks[native_id] = task
+            try:
+                output = await task
+            except StopAsyncIteration:
+                break
             for item in output.outputs:
                 status['output_tokens'] = max(status['output_tokens'], len(item.token_ids))
                 status['partial_text'] = item.text
@@ -302,5 +334,19 @@ async def generate_prepared(backend, entry, sampling_params):
             if output.finished:
                 status.update(finished=True, stopped_at=time.time())
             yield output
+    except asyncio.CancelledError:
+        if not entry.cancelled:
+            raise
+        # Let the Predict RPC return its collected partial result. The gateway
+        # classifies it using the stop proof, never as a completed answer.
+        stopped_by_control = True
     finally:
-        await outputs.aclose()
+        try:
+            if outputs is not None:
+                await outputs.aclose()
+        finally:
+            entry.generation_tasks.pop(native_id, None)
+    if stopped_by_control:
+        # Producer shutdown unlocks the abort/barrier above; keep the response
+        # behind that proof so its following status query cannot race it.
+        await entry.cancel_complete.wait()

@@ -30,7 +30,7 @@ def main():
     (destination / 'tools').mkdir(exist_ok=True)
     for name in ('localai.py', 'prepare_backend.py', 'migrate_backend.py'):
         shutil.copyfile(ROOT / 'tools' / name, destination / 'tools' / name)
-    manifest = {'version': '11.8.0', 'python': sys.version.split()[0],
+    manifest = {'version': '11.15.0', 'python': sys.version.split()[0],
                 'runtime': json.loads((ROOT / 'config/runtime-lock.json').read_text()),
                 'files': {p.relative_to(destination).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                           for p in sorted(destination.rglob('*')) if p.is_file() and p.name != 'manifest.json'}}
