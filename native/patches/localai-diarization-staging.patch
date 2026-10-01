@@ -1,0 +1,59 @@
+--- a/core/services/nodes/file_staging_client.go
++++ b/core/services/nodes/file_staging_client.go
+@@ -470,6 +470,20 @@
+ 		in.Src = backendPath
+ 	}
+ 	return f.Backend.SoundDetection(ctx, in, opts...)
++}
++
++func (f *FileStagingClient) Diarize(ctx context.Context, in *pb.DiarizeRequest, opts ...ggrpc.CallOption) (*pb.DiarizeResponse, error) {
++	lifecycle := f.newStagedInputLifecycle()
++	defer lifecycle.release()
++	in = proto.Clone(in).(*pb.DiarizeRequest)
++	if in.Dst != "" && isFilePath(in.Dst) {
++		backendPath, err := f.stageInputFile(ctx, lifecycle, in.Dst, "inputs")
++		if err != nil {
++			return nil, fmt.Errorf("staging audio for diarization: %w", err)
++		}
++		in.Dst = backendPath
++	}
++	return f.Backend.Diarize(ctx, in, opts...)
+ }
+ 
+ func (f *FileStagingClient) AudioTranscription(ctx context.Context, in *pb.TranscriptRequest, opts ...ggrpc.CallOption) (*pb.TranscriptResult, error) {
+--- /dev/null
++++ b/core/services/nodes/diarization_staging_test.go
+@@ -0,0 +1,33 @@
++package nodes
++
++import (
++ "context"
++ "errors"
++ "strings"
++ "testing"
++ grpc "github.com/mudler/LocalAI/pkg/grpc"
++ pb "github.com/mudler/LocalAI/pkg/grpc/proto"
++ ggrpc "google.golang.org/grpc"
++)
++
++type diarizationStagingBackend struct {
++ grpc.Backend
++ received string
++ failure error
++}
++func (b *diarizationStagingBackend) Diarize(_ context.Context, in *pb.DiarizeRequest, _ ...ggrpc.CallOption) (*pb.DiarizeResponse, error) {
++ b.received = in.Dst
++ return &pb.DiarizeResponse{}, b.failure
++}
++func TestDiarizationFileStaging(t *testing.T) {
++ for _, failure := range []error{nil, errors.New("native inference failed")} {
++  backend := &diarizationStagingBackend{failure: failure}
++  stager := &lifecycleStager{}
++  client := NewFileStagingClient(backend, stager, "worker-1")
++  request := &pb.DiarizeRequest{Dst: "/tmp/source.wav"}
++  _, err := client.Diarize(context.Background(), request)
++  if err != failure || request.Dst != "/tmp/source.wav" || !strings.HasPrefix(backend.received, "/remote/") || len(stager.releasedKeys) != 1 {
++   t.Fatalf("staging lifecycle mismatch: err=%v original=%s staged=%s released=%d", err, request.Dst, backend.received, len(stager.releasedKeys))
++  }
++ }
++}

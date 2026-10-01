@@ -1,0 +1,49 @@
+--- a/pkg/model/process.go
++++ b/pkg/model/process.go
+@@ -52,7 +52,7 @@
+ // force path skips that wait and Free(), stops the process, then cleans up.
+ // Callers serialize this operation per model, never with the global loader
+ // mutex, so a faulty backend cannot stall unrelated model lifecycle work.
+-func (ml *ModelLoader) deleteProcess(ctx context.Context, s string, force bool) error {
++func (ml *ModelLoader) deleteProcess(ctx context.Context, s string, force bool) (shutdownErr error) {
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+@@ -67,6 +67,13 @@
+ 	hooks := append([]ModelUnloadHook(nil), ml.onUnloadHooks...)
+ 	remoteUnloader := ml.remoteUnloader
+ 	ml.mu.Unlock()
++	// All callers, including health cleanup, finish tracking only after a
++	// confirmed unload. A failed remote/local stop is not proof of absence.
++	defer func() {
++		if shutdownErr == nil && wd != nil {
++			wd.ForgetModel(s)
++		}
++	}()
+ 
+ 	model, ok := store.Get(s)
+ 	if !ok {
+--- a/pkg/model/watchdog.go
++++ b/pkg/model/watchdog.go
+@@ -911,6 +911,21 @@
+ 	}
+ }
+ 
++// ForgetModel removes runtime tracking after a confirmed model unload.
++// Keep pinned/group configuration: it applies again when the model reloads.
++// Completion callbacks for removed requests are already idempotent in
++// finishRequestLocked, so they cannot recreate a forgotten address.
++func (wd *WatchDog) ForgetModel(modelName string) {
++	wd.Lock()
++	defer wd.Unlock()
++	for address, trackedModel := range wd.addressModelMap {
++		if trackedModel == modelName {
++			wd.untrack(address)
++		}
++	}
++	delete(wd.modelSizes, modelName)
++}
++
+ func (wd *WatchDog) untrack(address string) {
+ 	if modelID, ok := wd.addressModelMap[address]; ok {
+ 		delete(wd.modelSizes, modelID)

@@ -1,1 +1,1 @@
-"""V10 local model registration and API relay."""
+"""V11 LocalAI model registration, scheduling and API relay."""

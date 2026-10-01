@@ -1,0 +1,91 @@
+--- a/core/http/endpoints/openresponses/responses.go
++++ b/core/http/endpoints/openresponses/responses.go
+@@ -231,6 +231,10 @@
+ 
+ 			// Create cancellable context for background execution
+ 			bgCtx, bgCancel := context.WithCancel(context.Background())
++			// Inference must outlive the HTTP acknowledgement and honor the
++			// response-specific cancellation, rather than the completed POST.
++			input.Context, input.Cancel = bgCtx, bgCancel
++			openAIReq.Context, openAIReq.Cancel = bgCtx, bgCancel
+ 
+ 			// Store the background response and stamp its owner before the ID
+ 			// is returned to the client, so later GET/cancel/resume can verify
+@@ -936,6 +940,16 @@
+ 			return nil, fmt.Errorf("model inference failed: %w", err)
+ 		}
+ 
++		if content := functions.ContentFromChatDeltas(chatDeltas); content != "" {
++			result = content
++		}
++		if reasoning := functions.ReasoningFromChatDeltas(chatDeltas); reasoning != "" {
++			allOutputItems = append(allOutputItems, schema.ORItemField{
++				Type: "reasoning", ID: fmt.Sprintf("reasoning_%s", uuid.New().String()),
++				Status: "completed", Content: []schema.ORContentPart{makeOutputTextPart(reasoning)},
++			})
++		}
++
+ 		// Extract logprobs from choices if available
+ 		var resultLogprobs *schema.Logprobs
+ 		if len(choices) > 0 {
+@@ -1083,11 +1097,18 @@
+ 		}
+ 
+ 		now := time.Now().Unix()
+-		return buildORResponse(responseID, createdAt, &now, schema.ORStatusCompleted, input, allOutputItems, &schema.ORUsage{
++		response := buildORResponse(responseID, createdAt, &now, schema.ORStatusCompleted, input, allOutputItems, &schema.ORUsage{
+ 			InputTokens:  tokenUsage.Prompt,
+ 			OutputTokens: tokenUsage.Completion,
+ 			TotalTokens:  tokenUsage.Prompt + tokenUsage.Completion,
+-		}, true), nil
++		}, true)
++		// Match the native chat contract: reaching the configured ceiling is
++		// incomplete even when the backend did not preserve a finish reason.
++		if cfg.Maxtokens != nil && *cfg.Maxtokens > 0 && tokenUsage.Completion >= *cfg.Maxtokens {
++			response.Status = schema.ORStatusIncomplete
++			response.IncompleteDetails = &schema.ORIncompleteDetails{Reason: "max_output_tokens"}
++		}
++		return response, nil
+ 	} // end MCP iteration loop
+ 
+ 	return nil, fmt.Errorf("MCP iteration limit reached")
+--- a/core/http/endpoints/openresponses/store.go
++++ b/core/http/endpoints/openresponses/store.go
+@@ -433,6 +433,11 @@
+ 	}
+ 
+ 	stored.mu.Lock()
++	// A late goroutine error or completion must not reverse a committed cancel.
++	if stored.Response.Status == schema.ORStatusCancelled {
++		stored.mu.Unlock()
++		return nil
++	}
+ 	stored.Response.Status = status
+ 	stored.Response.CompletedAt = completedAt
+ 	stored.mu.Unlock()
+@@ -456,6 +461,10 @@
+ 	}
+ 
+ 	stored.mu.Lock()
++	if stored.Response.Status == schema.ORStatusCancelled {
++		stored.mu.Unlock()
++		return nil
++	}
+ 
+ 	// Rebuild item index
+ 	items := make(map[string]*schema.ORItemField)
+--- a/core/http/middleware/request.go
++++ b/core/http/middleware/request.go
+@@ -725,6 +725,12 @@
+ 
+ // MergeOpenResponsesConfig merges request parameters into the model configuration.
+ func MergeOpenResponsesConfig(config *config.ModelConfig, input *schema.OpenResponsesRequest) error {
++	if input.Reasoning != nil {
++		config.ApplyReasoningEffort(input.Reasoning.Effort)
++	} else {
++		config.ApplyReasoningEffort("")
++	}
++
+ 	// Temperature
+ 	if input.Temperature != nil {
+ 		config.Temperature = input.Temperature

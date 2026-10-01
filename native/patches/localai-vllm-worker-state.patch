@@ -1,0 +1,15 @@
+--- a/backend.py
++++ b/backend.py
+@@ -257,6 +257,12 @@
+             print(f"engine_args error: {err}", file=sys.stderr)
+             return backend_pb2.Result(success=False, message=str(err))
+ 
++        extension = "vllm_execution.AIToolboxWorkerExtension"
++        if engine_args.worker_extension_cls not in ("", extension):
++            return backend_pb2.Result(success=False, message="incompatible_native_worker_extension")
++        engine_args.worker_extension_cls = extension
++        # Only named RPCs with ordinary JSON values cross the worker boundary.
++
+         try:
+             self.llm = AsyncLLMEngine.from_engine_args(engine_args)
+         except Exception as err:

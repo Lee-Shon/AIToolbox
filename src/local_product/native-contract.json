@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "version": "11.8.0",
+  "llama_adapter_sha256": "f1817871d0b1b0f95b69197b6b9589147a9ddf23082d65d200efd7068455970d",
+  "vllm_adapter_sha256": "f584c32ae929f23c5e6b6950ebea4bc709627fec9d8f4cc9d60e6edefe9fcf8a"
+}

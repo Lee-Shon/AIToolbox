@@ -1,0 +1,150 @@
+--- a/backend.py
++++ b/backend.py
+@@ -19,10 +19,10 @@
+ import grpc
+ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'common'))
+ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
+-from python_utils import attach_media_parts
+ from grpc_auth import get_auth_interceptors
+ from model_utils import resolve_model_reference
+ from temp_utils import materialize_base64
++from vllm_execution import resolve_input, generate_prepared
+ from vllm_utils import apply_options_to_engine_args, normalize_option_key
+ 
+ from vllm.engine.arg_utils import AsyncEngineArgs
+@@ -322,8 +322,10 @@
+             backend_pb2.Reply: The predict result.
+         """
+         gen = self._predict(request, context, streaming=False)
+-        res = await gen.__anext__()
+-        return res
++        try:
++            return await gen.__anext__()
++        finally:
++            await gen.aclose()
+ 
+     def Embedding(self, request, context):
+         """
+@@ -381,6 +383,7 @@
+ 
+     async def Free(self, request, context):
+         try:
++            self._prepared_inputs = {}
+             if hasattr(self, 'llm'):
+                 del self.llm
+             if hasattr(self, 'tokenizer'):
+@@ -646,78 +649,18 @@
+             except json.JSONDecodeError:
+                 sampling_params.structured_outputs = StructuredOutputsParams(grammar=request.Grammar)
+ 
+-        # Extract image paths and process images
+-        prompt = request.Prompt
+-        # Kept in scope: the reasoning parser needs to know which chat
+-        # template kwargs produced this prompt.
+-        template_kwargs = {}
+-
+-        image_paths = request.Images
+-        image_data = [self.load_image(img_path) for img_path in image_paths]
+-
+-        videos_path = request.Videos
+-        video_data = [self.load_video(video_path) for video_path in videos_path]
+-
+-        # If tokenizer template is enabled and messages are provided instead of prompt, apply the tokenizer template
+-        if not request.Prompt and request.UseTokenizerTemplate and request.Messages:
+-            messages_dicts = self._messages_to_dicts(request.Messages)
+-            template_kwargs.update({"tokenize": False, "add_generation_prompt": True})
+-
+-            # Pass tools for tool calling
+-            if request.Tools:
+-                try:
+-                    template_kwargs["tools"] = json.loads(request.Tools)
+-                except json.JSONDecodeError:
+-                    pass
+-
+-            _thinking = request.Metadata.get("enable_thinking", "").lower()
+-            if _thinking in ("true", "false"):
+-                template_kwargs["enable_thinking"] = (_thinking == "true")
+-
+-            # vLLM substitutes multi_modal_data into the model's own media
+-            # token, so the template has to be given content *parts* - string
+-            # content renders a prompt with no placeholder and the media are
+-            # dropped without a word (#11621).
+-            prompt = None
+-            media_dicts = attach_media_parts(
+-                messages_dicts, len(image_data), len(video_data)
+-            )
+-            if media_dicts is not None:
+-                try:
+-                    prompt = self.tokenizer.apply_chat_template(media_dicts, **template_kwargs)
+-                except Exception as e:
+-                    # A text-only template cannot iterate content parts; fall
+-                    # through to the text-only prompt instead of failing.
+-                    print(
+-                        f"chat template rejected multimodal content parts: {e!r}",
+-                        file=sys.stderr,
+-                    )
+-
+-            if prompt is None:
+-                try:
+-                    prompt = self.tokenizer.apply_chat_template(messages_dicts, **template_kwargs)
+-                except TypeError:
+-                    # Some tokenizers don't support tools/enable_thinking kwargs — retry without them
+-                    prompt = self.tokenizer.apply_chat_template(
+-                        messages_dicts, tokenize=False, add_generation_prompt=True
+-                    )
+-
+-        # Generate text using the LLM engine
+-        request_id = random_uuid()
+-        print(f"Generating text with request_id: {request_id}", file=sys.stderr)
+-        multi_modal_data = {}
+-        if image_data:
+-            multi_modal_data["image"] = image_data
+-        if video_data:
+-            multi_modal_data["video"] = video_data
+-        outputs = self.llm.generate(
+-            {
+-            "prompt": prompt,
+-            "multi_modal_data": multi_modal_data if multi_modal_data else None,
+-            },
+-            sampling_params=sampling_params,
+-            request_id=request_id,
+-        )
++        try:
++            prepared, control = await resolve_input(self, request)
++        except ValueError as exc:
++            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
++        if control is not None:
++            value = json.dumps(control)
++            yield backend_pb2.Reply(message=value.encode(),
++                                   chat_deltas=[backend_pb2.ChatDelta(content=value)])
++            return
++        prompt = prepared.prompt
++        template_kwargs = prepared.template_kwargs
++        outputs = generate_prepared(self, prepared, sampling_params)
+ 
+         # Stream the results
+         generated_text = ""
+@@ -842,13 +785,6 @@
+         finally:
+             await outputs.aclose()
+ 
+-        # Remove the image files from /tmp folder
+-        for img_path in image_paths:
+-            try:
+-                os.remove(img_path)
+-            except Exception as e:
+-                print(f"Error removing image file: {img_path}, {e}", file=sys.stderr)
+-
+         # Parse reasoning and tool calls from final text using vLLM's native parsers
+         content = generated_text
+         reasoning_content = ""
+@@ -1011,6 +947,9 @@
+             print(f"Error loading video {video_path}: {e}", file=sys.stderr)
+             return None
+ 
++from vllm_asr_bridge import audio_transcription
++BackendServicer.AudioTranscription = audio_transcription
++
+ async def serve(address):
+     # Start asyncio gRPC server
+     server = grpc.aio.server(migration_thread_pool=futures.ThreadPoolExecutor(max_workers=MAX_WORKERS),

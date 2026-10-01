@@ -1,0 +1,702 @@
+--- a/core/services/nodes/registry.go
++++ b/core/services/nodes/registry.go
+@@ -22,6 +22,10 @@
+ // Workers are generic — they don't have a fixed backend type.
+ // The SmartRouter dynamically installs backends via NATS backend.install events.
+ type BackendNode struct {
++	NativeObservationSequence uint64 `gorm:"not null;default:0" json:"native_observation_sequence"`
++	NativeVRAMObservationSequence uint64 `gorm:"column:native_vram_observation_sequence;not null;default:0" json:"native_vram_observation_sequence"`
++	NativeRAMObservedAt *time.Time `gorm:"column:native_ram_observed_at" json:"native_ram_observed_at"`
++	NativeVRAMObservedAt *time.Time `gorm:"column:native_vram_observed_at" json:"native_vram_observed_at"`
+ 	ID            string `gorm:"primaryKey;size:36" json:"id"`
+ 	Name          string `gorm:"uniqueIndex;size:255" json:"name"`
+ 	NodeType      string `gorm:"size:32;default:backend" json:"node_type"`    // backend, agent
+@@ -487,7 +491,7 @@
+ // when multiple instances (frontend + workers) start at the same time.
+ func NewNodeRegistry(db *gorm.DB) (*NodeRegistry, error) {
+ 	if err := advisorylock.WithLockCtx(context.Background(), db, advisorylock.KeySchemaMigrate, func() error {
+-		return db.AutoMigrate(&BackendNode{}, &NodeModel{}, &NodeLabel{}, &ModelSchedulingConfig{}, &PendingBackendOp{}, &ModelLoadInfo{}, &ModelLoadJob{}, &ModelConfigState{})
++		return db.AutoMigrate(&BackendNode{}, &NodeModel{}, &NodeLabel{}, &ModelSchedulingConfig{}, &PendingBackendOp{}, &ModelLoadInfo{}, &ModelLoadJob{}, &ModelConfigState{}, &NativeAllocation{}, &NativeCallReservation{}, &NativeResourceWait{})
+ 	}); err != nil {
+ 		return nil, fmt.Errorf("migrating node tables: %w", err)
+ 	}
+@@ -1115,7 +1119,7 @@
+ 	// interval out of date. That costs at most one extra or one late write; it
+ 	// cannot persist a wrong figure, because the write path below re-reads the
+ 	// ceiling before it caps anything.
+-	if r.skipHeartbeatWrite(nodeID, update) {
++	if !nativeResourcesEnabled() && r.skipHeartbeatWrite(nodeID, update) {
+ 		return nil
+ 	}
+ 
+@@ -1123,6 +1127,18 @@
+ 		ColLastHeartbeat: time.Now(),
+ 	}
+ 
++	if nativeResourcesEnabled() {
++		updates["native_ram_observed_at"]=nil
++		updates["native_vram_observed_at"]=nil
++		if update!=nil&&update.AvailableRAM!=nil {
++			updates["native_ram_observed_at"]=time.Now()
++			updates["native_observation_sequence"]=gorm.Expr("native_observation_sequence + 1")
++		}
++		if update!=nil&&update.AvailableVRAM!=nil {
++			updates["native_vram_observed_at"]=time.Now()
++			updates["native_vram_observation_sequence"]=gorm.Expr("native_vram_observation_sequence + 1")
++		}
++	}
+ 	var ceiling uint64
+ 	if update != nil {
+ 		if update.AvailableVRAM != nil {
+--- a/core/services/nodes/router.go
++++ b/core/services/nodes/router.go
+@@ -348,7 +348,7 @@
+ 	// Tune node-agnostic options to the SELECTED node's GPU. Only now do we know
+ 	// which node (and its compute capability) will run the model — the frontend
+ 	// that built modelOpts may have no GPU at all in distributed mode.
+-	applyNodeHardwareDefaults(modelOpts, node, backendType)
++	if !nativeResourcesEnabled() { applyNodeHardwareDefaults(modelOpts, node, backendType) }
+ 
+ 	// Publish the load lifecycle from the moment the node is chosen: staging a
+ 	// large model takes minutes, and without a registry row the whole phase is
+@@ -366,6 +366,10 @@
+ 			return
+ 		}
+ 		cleanupCtx := context.WithoutCancel(ctx)
++		if nativeResourcesEnabled() {
++			if err := r.quarantineNativeReplica(cleanupCtx,node.ID,trackingKey,replicaIndex,backendAddr); err != nil { xlog.Warn("Native failed load held for confirmed cleanup", "error",err) }
++			return
++		}
+ 		// An edit may have quarantined this row while staging/loading was in
+ 		// flight. Its cleanup intent is durable and must not be erased by the
+ 		// ordinary failed-load cleanup path.
+@@ -454,6 +458,10 @@
+ 		}
+ 	}
+ 
++	if nativeResourcesEnabled() {
++		if err := r.publishNativeLoaded(ctx,node.ID,trackingKey,replicaIndex,backendAddr); err != nil { return nil,err }
++		initialInFlight=0 // the native RPC claim is the eviction fence
++	}
+ 	// Record the model as loaded on this node (specific replica slot). From
+ 	// here the row is authoritative; the failure-cleanup defer must not touch it.
+ 	if err := r.setNodeModelState(ctx, node.ID, trackingKey, replicaIndex, "loaded", backendAddr, initialInFlight, configRevision, effectiveOptionsHash); err != nil {
+@@ -674,6 +682,9 @@
+ 		observeChain:     observeChain,
+ 	}
+ 
++	if nativeResourcesEnabled() {
++		if _,err:=nativeProfile(modelOpts);err!=nil{return nil,err}
++	}
+ 	// Step 1: Find and atomically lock a node with this model loaded
+ 	if result := r.tryWarmPath(ctx, att); result != nil {
+ 		return result, nil
+@@ -1055,6 +1066,7 @@
+ // the worker has been told to use; the caller must pass the same index into
+ // SetNodeModel so the registry row matches the live process.
+ func (r *SmartRouter) scheduleNewModel(ctx context.Context, backendType, modelID string, modelOpts *pb.ModelOptions) (*BackendNode, string, int, error) {
++	if nativeResourcesEnabled() { return r.waitNativeReserved(ctx, backendType, modelID, modelOpts) }
+ 	// Estimate VRAM required for the model
+ 	var estimatedVRAM uint64
+ 	if modelOpts != nil {
+@@ -1999,7 +2011,11 @@
+ 			}
+ 		})
+ 	}
+-	tracked.OnFirstComplete(release)
++	if nativeResourcesEnabled() {
++		var allocation NativeAllocation
++		if r.db.WithContext(context.Background()).Where("node_id = ? AND model_name = ? AND replica_index = ? AND state = ?",node.ID,trackingKey,replicaIdx,"live").First(&allocation).Error==nil { tracked.nativeAllocationID=allocation.ID }
++		release() // actual RPC admission owns the durable slot and eviction fence
++	} else { tracked.OnFirstComplete(release) }
+ 	return &RouteResult{
+ 		Node:   node,
+ 		Client: tracked,
+@@ -2020,6 +2036,7 @@
+ // and removes every replica row for (nodeID, modelName).
+ // The worker process handles Free() + kill + deregister.
+ func (r *SmartRouter) UnloadModel(ctx context.Context, nodeID, modelName string) error {
++	if nativeResourcesEnabled() { return r.unloadNativeReserved(ctx,nodeID,modelName) }
+ 	if r.unloader == nil {
+ 		return fmt.Errorf("no remote unloader configured")
+ 	}
+@@ -2082,6 +2099,7 @@
+ // unavailable this repeated, and the evicted model appeared to bounce between
+ // nodes.
+ func (r *SmartRouter) evictLRUAndFreeNodeFrom(ctx context.Context, candidateNodeIDs []string) (*BackendNode, error) {
++	if nativeResourcesEnabled() { return nil, ErrResourceWaiting }
+ 	const maxEvictionRetries = 5
+ 	const evictionRetryInterval = 500 * time.Millisecond
+ 
+--- a/core/services/nodes/unloader.go
++++ b/core/services/nodes/unloader.go
+@@ -100,6 +100,17 @@
+ 	ctx, cancel := context.WithTimeout(ctx, exactModelStopTimeout)
+ 	defer cancel()
+ 
++	if nativeResourcesEnabled() {
++		owner,ok:=a.registry.(interface{NativeStopReady(context.Context,NodeModel)error})
++		if !ok{return messaging.ModelStopReply{},ErrResourceStopUnconfirmed}
++		if err:=owner.NativeStopReady(ctx,replica);err!=nil{return messaging.ModelStopReply{},err}
++	}
++	allocationID := ""
++	if source,ok := a.registry.(interface{ NativeStopAllocationID(context.Context,NodeModel)(string,error) }); ok && nativeResourcesEnabled() {
++		var err error
++		allocationID,err=source.NativeStopAllocationID(ctx,replica)
++		if err!=nil{return messaging.ModelStopReply{},err}
++	}
+ 	type result struct {
+ 		reply *messaging.ModelStopReply
+ 		err   error
+@@ -107,6 +118,7 @@
+ 	done := make(chan result, 1)
+ 	go func() {
+ 		reply, err := messaging.RequestJSON[messaging.ModelStopRequest, messaging.ModelStopReply](a.nats, messaging.SubjectNodeModelStop(nodeID), messaging.ModelStopRequest{
++			AllocationID:    allocationID,
+ 			ModelName:       replica.ModelName,
+ 			ProcessKey:      model.BackendProcessKey(replica.ModelName, replica.ReplicaIndex),
+ 			ExpectedAddress: replica.Address,
+@@ -184,6 +196,7 @@
+ 			unloadErr = errors.Join(unloadErr, fmt.Errorf("stopping model on node %s: %w", node.ID, err))
+ 			continue
+ 		}
++		if nativeResourcesEnabled() { continue } // exact native cleanup already removed only its fenced row
+ 		// Remove every replica of this model on the node — the worker will
+ 		// handle the actual process cleanup.
+ 		if err := a.registry.RemoveAllNodeModelReplicas(ctx, node.ID, modelName); err != nil {
+@@ -458,6 +471,7 @@
+ // old Publish it was reported too, and callers such as UnloadRemoteModel rely
+ // on that to skip the registry cleanup for a node they could not reach.
+ func (a *RemoteUnloaderAdapter) stopBackend(nodeID, backend string, force bool) error {
++	if nativeResourcesEnabled() { return a.nativeUnloadIdle(context.Background(),nodeID,backend) }
+ 	subject := messaging.SubjectNodeBackendStop(nodeID)
+ 	req := messaging.BackendStopRequest{Backend: backend, Force: force}
+ 
+@@ -548,6 +562,7 @@
+ // UnloadModelOnNode sends a model.unload request to a specific node.
+ // The worker calls gRPC Free() to release GPU memory.
+ func (a *RemoteUnloaderAdapter) UnloadModelOnNode(nodeID, modelName string) error {
++	if nativeResourcesEnabled() { return a.nativeUnloadIdle(context.Background(),nodeID,modelName) }
+ 	subject := messaging.SubjectNodeModelUnload(nodeID)
+ 	xlog.Info("Sending NATS model.unload", "nodeID", nodeID, "model", modelName)
+ 
+--- a/core/services/nodes/model_cleanup.go
++++ b/core/services/nodes/model_cleanup.go
+@@ -7,6 +7,7 @@
+ 	"time"
+ 
+ 	"github.com/mudler/xlog"
++	"github.com/mudler/LocalAI/core/services/messaging"
+ )
+ 
+ const (
+@@ -33,6 +34,11 @@
+ 	pending := 0
+ 	for _, replica := range replicas {
+ 		reply, err := s.stopper.StopModelReplica(ctx, replica.NodeID, replica, force)
++		if err == nil && reply.Terminated && nativeResourcesEnabled() {
++			if owner,ok:=s.registry.(interface{ ConfirmNativeStop(context.Context,NodeModel,messaging.ModelStopReply)error });ok{
++				err=owner.ConfirmNativeStop(ctx,replica,reply)
++			}else{err=ErrResourceStopUnconfirmed}
++		}
+ 		if err == nil && reply.Terminated {
+ 			removed, removeErr := s.registry.RemoveClaimedModelCleanup(ctx, replica)
+ 			if removeErr != nil {
+--- a/core/services/messaging/subjects.go
++++ b/core/services/messaging/subjects.go
+@@ -162,6 +162,7 @@
+ 
+ // BackendInstallRequest is the payload for a backend.install NATS request.
+ type BackendInstallRequest struct {
++	AllocationID string `json:"allocation_id,omitempty"`
+ 	Backend          string `json:"backend"`
+ 	ModelID          string `json:"model_id,omitempty"`
+ 	BackendGalleries string `json:"backend_galleries,omitempty"`
+@@ -193,6 +194,7 @@
+ 
+ // BackendInstallReply is the response from a backend.install NATS request.
+ type BackendInstallReply struct {
++	AllocationID string `json:"allocation_id,omitempty"`
+ 	Success bool   `json:"success"`
+ 	Address string `json:"address,omitempty"` // gRPC address of the backend process (host:port)
+ 	Error   string `json:"error,omitempty"`
+@@ -331,6 +333,7 @@
+ }
+ 
+ type ModelStopRequest struct {
++	AllocationID string `json:"allocation_id,omitempty"`
+ 	ModelName       string `json:"model_name"`
+ 	ProcessKey      string `json:"process_key"`
+ 	ExpectedAddress string `json:"expected_address"`
+@@ -339,6 +342,7 @@
+ }
+ 
+ type ModelStopReply struct {
++	AllocationID string `json:"allocation_id,omitempty"`
+ 	Matched    bool   `json:"matched"`
+ 	Freed      bool   `json:"freed"`
+ 	Terminated bool   `json:"terminated"`
+--- a/core/services/worker/supervisor.go
++++ b/core/services/worker/supervisor.go
+@@ -1,6 +1,7 @@
+ package worker
+ 
+ import (
++	"net"
+ 	"context"
+ 	"errors"
+ 	"fmt"
+@@ -24,6 +25,7 @@
+ 
+ // backendProcess represents a single gRPC backend process.
+ type backendProcess struct {
++	allocationID string
+ 	proc *process.Process
+ 	addr string // gRPC address (host:port)
+ 	port int
+@@ -868,10 +870,18 @@
+ // The address check and stopping reservation are one critical section so a
+ // stale controller request can never stop a replacement under the same key.
+ func (s *backendSupervisor) stopModelExact(req messaging.ModelStopRequest) messaging.ModelStopReply {
+-	reply := messaging.ModelStopReply{ProcessKey: req.ProcessKey}
+-
++	reply := messaging.ModelStopReply{ProcessKey: req.ProcessKey,AllocationID:req.AllocationID}
++	if req.AllocationID!="" { release:=s.lockBackend("allocation:"+req.ProcessKey);defer release() }
+ 	s.mu.Lock()
+ 	bp, ok := s.processes[req.ProcessKey]
++	if req.AllocationID!="" {
++		s.mu.Unlock()
++		closed,err:=prepareGenerationStop(req,bp)
++		if err!=nil{reply.Error=err.Error();return reply}
++		if closed{reply.Terminated=true;reply.Address=req.ExpectedAddress;return reply}
++		s.mu.Lock()
++		if s.processes[req.ProcessKey]!=bp{ s.mu.Unlock();reply.Error="native generation changed";return reply }
++	}
+ 	if !ok || bp.proc == nil {
+ 		s.mu.Unlock()
+ 		reply.Terminated = true
+@@ -879,7 +889,13 @@
+ 	}
+ 	reply.Matched = true
+ 	reply.Address = bp.addr
+-	if bp.addr != req.ExpectedAddress {
++	expectedAddress:=req.ExpectedAddress
++	if req.AllocationID!="" {
++		host,_,hostErr:=net.SplitHostPort(s.cfg.advertiseAddr())
++		_,port,portErr:=net.SplitHostPort(bp.addr)
++		if hostErr==nil&&portErr==nil&&req.ExpectedAddress==net.JoinHostPort(host,port){ expectedAddress=bp.addr;reply.Address=req.ExpectedAddress }
++	}
++	if bp.addr != expectedAddress {
+ 		s.mu.Unlock()
+ 		reply.Error = fmt.Sprintf("address mismatch for process %s: recorded %q, expected %q", req.ProcessKey, bp.addr, req.ExpectedAddress)
+ 		return reply
+@@ -916,6 +932,9 @@
+ 		}
+ 		return reply
+ 	}
++	if req.AllocationID!="" {
++		if err:=saveGeneration(allocationGeneration{ID:req.AllocationID,ProcessKey:req.ProcessKey,Address:reply.Address,State:"closed"});err!=nil{reply.Error=err.Error();return reply}
++	}
+ 	reply.Terminated = true
+ 	return reply
+ }
+--- a/core/services/worker/lifecycle.go
++++ b/core/services/worker/lifecycle.go
+@@ -22,6 +22,7 @@
+ // subject a 2-line patch (one line here, one new method) instead of grafting
+ // onto a monolith.
+ func (s *backendSupervisor) subscribeLifecycleEvents() error {
++	if _,err:=s.nats.SubscribeReply(messaging.SubjectNodeBackendInstall(s.nodeID)+".reserved",s.handleReservedBackendInstall);err!=nil{return err}
+ 	if _, err := s.nats.SubscribeReply(messaging.SubjectNodeBackendInstall(s.nodeID), s.handleBackendInstall); err != nil {
+ 		return fmt.Errorf("subscribing to backend install events: %w", err)
+ 	}
+--- a/core/services/nodes/inflight.go
++++ b/core/services/nodes/inflight.go
+@@ -28,6 +28,7 @@
+ // until it is wrapped with track() - so a new inference path can't be added
+ // without an in-flight accounting decision.
+ type InFlightTrackingClient struct {
++	nativeAllocationID string
+ 	grpc.ControlBackend                       // passthrough for control-plane / streaming-constructor methods
+ 	inner               grpc.InferenceBackend // tracked inference methods delegate here
+ 	registry            InFlightTracker
+@@ -116,167 +117,307 @@
+ // --- Tracked inference methods ---
+ 
+ func (c *InFlightTrackingClient) Predict(ctx context.Context, in *pb.PredictOptions, opts ...ggrpc.CallOption) (*pb.Reply, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	reply, err := c.inner.Predict(ctx, in, opts...)
++	nativeErr=err
+ 	return reply, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) PredictStream(ctx context.Context, in *pb.PredictOptions, f func(reply *pb.Reply), opts ...ggrpc.CallOption) error {
+-	defer c.track(ctx)()
+-	return c.reconcile(c.inner.PredictStream(ctx, in, f, opts...))
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
++	defer c.track(ctx)()
++	nativeErr = c.inner.PredictStream(ctx, in, f, opts...)
++	return c.reconcile(nativeErr)
+ }
+ 
+ func (c *InFlightTrackingClient) Embeddings(ctx context.Context, in *pb.PredictOptions, opts ...ggrpc.CallOption) (*pb.EmbeddingResult, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.Embeddings(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) GenerateImage(ctx context.Context, in *pb.GenerateImageRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.GenerateImage(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) UpscaleImage(ctx context.Context, in *pb.UpscaleImageRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.UpscaleImage(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) GenerateVideo(ctx context.Context, in *pb.GenerateVideoRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.GenerateVideo(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) Generate3D(ctx context.Context, in *pb.Generate3DRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.Generate3D(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) TTS(ctx context.Context, in *pb.TTSRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.TTS(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) TTSStream(ctx context.Context, in *pb.TTSRequest, f func(reply *pb.Reply), opts ...ggrpc.CallOption) error {
+-	defer c.track(ctx)()
+-	return c.reconcile(c.inner.TTSStream(ctx, in, f, opts...))
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
++	defer c.track(ctx)()
++	nativeErr = c.inner.TTSStream(ctx, in, f, opts...)
++	return c.reconcile(nativeErr)
+ }
+ 
+ func (c *InFlightTrackingClient) SoundGeneration(ctx context.Context, in *pb.SoundGenerationRequest, opts ...ggrpc.CallOption) (*pb.Result, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.SoundGeneration(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) AudioTranscription(ctx context.Context, in *pb.TranscriptRequest, opts ...ggrpc.CallOption) (*pb.TranscriptResult, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.AudioTranscription(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) AudioTranscriptionStream(ctx context.Context, in *pb.TranscriptRequest, f func(chunk *pb.TranscriptStreamResponse), opts ...ggrpc.CallOption) error {
+-	defer c.track(ctx)()
+-	return c.reconcile(c.inner.AudioTranscriptionStream(ctx, in, f, opts...))
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
++	defer c.track(ctx)()
++	nativeErr = c.inner.AudioTranscriptionStream(ctx, in, f, opts...)
++	return c.reconcile(nativeErr)
+ }
+ 
+ func (c *InFlightTrackingClient) Detect(ctx context.Context, in *pb.DetectOptions, opts ...ggrpc.CallOption) (*pb.DetectResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.Detect(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) Depth(ctx context.Context, in *pb.DepthRequest, opts ...ggrpc.CallOption) (*pb.DepthResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.Depth(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) Rerank(ctx context.Context, in *pb.RerankRequest, opts ...ggrpc.CallOption) (*pb.RerankResult, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.Rerank(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) VAD(ctx context.Context, in *pb.VADRequest, opts ...ggrpc.CallOption) (*pb.VADResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.VAD(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) Diarize(ctx context.Context, in *pb.DiarizeRequest, opts ...ggrpc.CallOption) (*pb.DiarizeResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.Diarize(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) FaceVerify(ctx context.Context, in *pb.FaceVerifyRequest, opts ...ggrpc.CallOption) (*pb.FaceVerifyResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.FaceVerify(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) FaceAnalyze(ctx context.Context, in *pb.FaceAnalyzeRequest, opts ...ggrpc.CallOption) (*pb.FaceAnalyzeResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.FaceAnalyze(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) VoiceVerify(ctx context.Context, in *pb.VoiceVerifyRequest, opts ...ggrpc.CallOption) (*pb.VoiceVerifyResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.VoiceVerify(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) VoiceAnalyze(ctx context.Context, in *pb.VoiceAnalyzeRequest, opts ...ggrpc.CallOption) (*pb.VoiceAnalyzeResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.VoiceAnalyze(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) VoiceEmbed(ctx context.Context, in *pb.VoiceEmbedRequest, opts ...ggrpc.CallOption) (*pb.VoiceEmbedResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.VoiceEmbed(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) TokenClassify(ctx context.Context, in *pb.TokenClassifyRequest, opts ...ggrpc.CallOption) (*pb.TokenClassifyResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.TokenClassify(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) Score(ctx context.Context, in *pb.ScoreRequest, opts ...ggrpc.CallOption) (*pb.ScoreResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.Score(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) SoundDetection(ctx context.Context, in *pb.SoundDetectionRequest, opts ...ggrpc.CallOption) (*pb.SoundDetectionResponse, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.SoundDetection(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) AudioEncode(ctx context.Context, in *pb.AudioEncodeRequest, opts ...ggrpc.CallOption) (*pb.AudioEncodeResult, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.AudioEncode(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) AudioDecode(ctx context.Context, in *pb.AudioDecodeRequest, opts ...ggrpc.CallOption) (*pb.AudioDecodeResult, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.AudioDecode(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+ func (c *InFlightTrackingClient) AudioTransform(ctx context.Context, in *pb.AudioTransformRequest, opts ...ggrpc.CallOption) (*pb.AudioTransformResult, error) {
++	finishNative,admissionErr:=c.nativeTrack(ctx)
++	if admissionErr!=nil { return nil,admissionErr }
++	var nativeErr error=ErrResourceStopUnconfirmed
++	defer func(){finishNative(nativeErr)}()
+ 	defer c.track(ctx)()
+ 	res, err := c.inner.AudioTransform(ctx, in, opts...)
++	nativeErr=err
+ 	return res, c.reconcile(err)
+ }
+ 
+--- a/core/http/routes/nodes.go
++++ b/core/http/routes/nodes.go
+@@ -69,6 +69,8 @@
+ 	readyMw := nodeReadyMiddleware(registry)
+ 
+ 	admin := e.Group("/api/nodes", readyMw, adminMw)
++	admin.GET("/resources",func(c echo.Context)error{body,err:=registry.NativeResourceStatus(c.Request().Context());if err!=nil{return err};return c.JSON(http.StatusOK,body)})
++	admin.GET("/resource-profile/:model",func(c echo.Context)error{body,err:=registry.NativeResourceConfiguration(c.Request().Context(),c.Param("model"));if err!=nil{return err};return c.JSON(http.StatusOK,body)})
+ 	admin.GET("", localai.ListNodesEndpoint(registry))
+ 
+ 	// Cluster-wide loaded models (registered before /:id to avoid route conflicts)
+--- a/core/http/endpoints/localai/nodes.go
++++ b/core/http/endpoints/localai/nodes.go
+@@ -1,6 +1,7 @@
+ package localai
+ 
+ import (
++	"os"
+ 	"context"
+ 	"crypto/sha256"
+ 	"crypto/subtle"
+@@ -697,6 +698,7 @@
+ 			xlog.Error("Failed to unload model on node", "node", nodeID, "model", req.ModelName, "error", err)
+ 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to unload model on node"))
+ 		}
++		if _,enabled:=os.LookupEnv("LOCALAI_RESOURCE_POLICY");enabled{return c.JSON(http.StatusOK,map[string]string{"message":"model unloaded with native stop receipt"})}
+ 		// Also stop the backend process
+ 		if err := unloader.StopBackend(nodeID, req.ModelName); err != nil {
+ 			xlog.Error("Failed to stop backend after model unload", "node", nodeID, "model", req.ModelName, "error", err)
+@@ -725,6 +727,7 @@
+ 		if err := unloader.UnloadModelOnNode(nodeID, req.ModelName); err != nil {
+ 			return c.JSON(http.StatusInternalServerError, nodeError(http.StatusInternalServerError, "failed to unload model before deletion"))
+ 		}
++		if _,enabled:=os.LookupEnv("LOCALAI_RESOURCE_POLICY");enabled{return c.JSON(http.StatusOK,map[string]string{"message":"model unloaded with native stop receipt"})}
+ 		if err := unloader.StopBackend(nodeID, req.ModelName); err != nil {
+ 			// Non-fatal — backend process may not be running
+ 			xlog.Warn("StopBackend failed during model deletion (non-fatal)", "node", nodeID, "model", req.ModelName, "error", err)
+--- a/core/services/testutil/testdb.go
++++ b/core/services/testutil/testdb.go
+@@ -1,6 +1,9 @@
+ package testutil
+ 
+ import (
++	"os"
++	"strings"
++	"github.com/google/uuid"
+ 	"context"
+ 	"runtime"
+ 	"time"
+@@ -19,6 +22,16 @@
+ // SetupTestDB creates a fresh PostgreSQL 16 container and returns a gorm.DB.
+ // The container is cleaned up via DeferCleanup when the test completes.
+ func SetupTestDB() *gorm.DB {
++	if dsn:=os.Getenv("LOCALAI_TEST_POSTGRES_DSN");dsn!=""{
++		schema:="native_test_"+strings.ReplaceAll(uuid.NewString(),"-","")
++		options:=&gorm.Config{Logger:logger.Default.LogMode(logger.Silent)}
++		owner,err:=gorm.Open(postgres.Open(dsn),options);Expect(err).ToNot(HaveOccurred())
++		Expect(owner.Exec("CREATE SCHEMA "+schema).Error).To(Succeed())
++		DeferCleanup(func(){owner.Exec("DROP SCHEMA "+schema+" CASCADE");sqlDB,_:=owner.DB();sqlDB.Close()})
++		db,err:=gorm.Open(postgres.Open(dsn+" search_path="+schema),options);Expect(err).ToNot(HaveOccurred())
++		DeferCleanup(func(){sqlDB,_:=db.DB();sqlDB.Close()})
++		return db
++	}
+ 	if runtime.GOOS == "darwin" {
+ 		Skip("testcontainers requires Docker, not available on macOS CI")
+ 	}

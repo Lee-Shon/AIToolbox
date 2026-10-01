@@ -1,10 +1,9 @@
 {
-  "component": "llama.cpp",
-  "release": "b10621",
-  "platform": "win-cpu-x64",
-  "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10621/llama-b10621-bin-win-cpu-x64.zip",
-  "sha256": "0e8b65e650e369f70f8307d890508886f171ef4fb00facccddd4a1b7ffdaca51",
-  "bytes": 18068018,
-  "license": "MIT",
-  "license_url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/b10621/LICENSE"
+  "version": "11.8.0",
+  "migrated_from": "v11.7.0",
+  "localai_commit": "7ad0cbf259f0c7bf9920fe2438fc3630ecd6c672",
+  "llama_commit": "38a5b42d9a3e82e0a586bcd1caed121f36c87a73",
+  "base_image": "localai/localai@sha256:9f999a8cdb4d5468a6ed6574cfeab08ab1efe49466f5d88a3cc146b372c48d65",
+  "llama_backend": "quay.io/go-skynet/local-ai-backends@sha256:356e75a5da92de3d11c5ae12bb543a90cd9c2cf8631412f7525faa382e6a2dd8",
+  "vllm_backend": "quay.io/go-skynet/local-ai-backends@sha256:61d1722c3677c3a81855068092ea7dec26e3b3c3273ded39e85e19a89e229ea3"
 }

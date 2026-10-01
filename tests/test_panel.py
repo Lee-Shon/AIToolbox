@@ -14,7 +14,7 @@ class Desktop(unittest.TestCase):
     def test_provider_form_saves_updates_and_removes_only_selected_provider(self):
         import tkinter as tk
         with tempfile.TemporaryDirectory(prefix="aitoolbox-ui-test-") as directory:
-            app = Application(Path(directory), cloud_port=0, local_port=0, executable=Path(sys.executable))
+            app = Application(Path(directory), cloud_port=0, local_port=0)
             root = tk.Tk()
             root.withdraw()
             callback_errors = []

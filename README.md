@@ -1,113 +1,117 @@
-# AIToolbox
+# AIToolbox · V11 独立版
 
-**把你自己的本地模型和云厂商接成可调用的 API。**
+把自己的本地模型和云厂商接成 API，保存结果、原请求身份与用量。首次启动没有预置厂商、模型或账号；模型文件、账号和密钥由使用者提供。
 
-AIToolbox 负责注册验证、请求中转、结果保存和用量统计。模型、厂商账号与密钥属于使用者。首次启动没有预置厂商、模型或账号；它不是出售模型的服务，也不自动替你选择厂商。
+**当前版本 11.8.0，直接迁入主线 v11.7.0 已完成的升级。** 本地服务、两层资源安排、批次连续段停止、LocalAI 原生扩展沿用该版本；独立版保留自己的窗口、云厂商配置、凭据、数据库和端口。旧 v10.3.0 CPU 版可从 Git 历史恢复。
 
-## 普通用户：解压后启动
+## 运行环境与启动
 
-适用 Windows 10/11 64 位。解压完整 `AIToolbox-Windows-x64.zip`，双击其中的 **AIToolbox.exe**。保留旁边的 `_internal` 文件夹；不要单独移动 exe。
+Windows 10/11 x64；桌面源码使用 Python 3.11 和 Tk。**本地模型运行改用 WSL2、Docker、NVIDIA GPU 与匹配的 NVIDIA Container Toolkit，原先“无需 Docker、内置 CPU 单模型运行时”的说明已失效。** 云端入口可以在本地后端尚未准备时独立使用。不会自动下载模型。
 
-发行包内置 Python、桌面界面、数据库和 CPU 推理引擎，不需要安装 Python、Docker、CUDA 或旧版 AIToolbox。首次启动自动创建自己的数据目录和调用凭据。联网仅用于你主动发起的云厂商调用，不自动下载模型。
+本仓库发布源码，不附带模型、现用配置、私有数据、Docker 镜像或 Windows 二进制发行包。先按下面准备 V11 后端；普通未打补丁的 LocalAI 镜像不具备本产品所需的原生计数、资源画像和停止确认协议。
 
-窗口有四页：
+1. 在自己的 WSL2 发行版中准备 Docker 和 NVIDIA Container Toolkit，确认 Docker 能访问显卡。以下示例发行版名为 `Ubuntu`，可以换成自己的名称。
+2. 在 WSL 中准备固定上游源码并构建后端。`/path/to/AIToolbox` 指本仓库在 WSL 中的路径；构建需要网络、足够磁盘空间和时间，后端依赖为数 GB 级。
 
-| 页面 | 怎么用 |
-| --- | --- |
-| 云厂商 | 新增厂商标识、API 根地址、协议/认证、API Key 和模型名称；可随时修改或删除 |
-| 本地模型管理 | 选择已有 GGUF 权重和必要的多模态投影文件，填写模型 ID、实例总上下文与能力，注册、修改并查看状态 |
-| 用量 | 查看最近 7 天云端和本地调用次数、输入/输出 token、未计量调用及每日明细 |
-| 接入与测试 | 查看接口地址，复制调用凭据到自己的客户端，指定模型发送一次测试请求 |
+   ```bash
+   python3 /path/to/AIToolbox/tools/prepare_backend.py --output "$HOME/aitoolbox-build"
+   docker build -t aitoolbox-localai:11.8.0 "$HOME/aitoolbox-build"
+   ```
 
-云厂商标识使用小写英文开头，可含数字、下划线和横线。API 根地址填写厂商文档的完整根地址，通常以 `/v1` 结尾；外部地址必须是 HTTPS，本机地址可用 HTTP。模型名称每行一个，只用于展示目录，不是调用白名单。更换厂商配置立即作用于新请求，旧记录继续保留原配置快照。
+   **已有 V11.7 部署可直接迁移，跳过上述从零构建：**
 
-选择 OpenAI 兼容时使用 Bearer 认证；Anthropic 使用 `x-api-key` 并传递 `anthropic-version`；其他 API-Key 接口使用 `api-key`。程序按原协议转发，不在 Chat Completions、Responses、Messages 之间自动转换。厂商是否支持某个模型、路径或参数，以厂商实际响应为准。
+   ```bash
+   python3 /path/to/AIToolbox/tools/migrate_backend.py --backends /your/existing/backends
+   ```
 
-本地模型先经过文件、内存及所选能力的真实验证，`READY` 后才可调用。注册不会下载或复制权重。内置运行时支持的 GGUF 架构才能启用；多模态还需要匹配的投影文件。取消注册停止新请求并等待已受理请求结束，**不会删除权重或历史记录**。
+   默认读取已验证镜像 `aitoolbox-localai:v4.10.0-contract-v4`，也可用 `--source-image` 指定。工具核对适配器后，将原镜像与两个已安装后端完整复制进独立镜像，不重新编译、不修改旧后端，也不复制模型、配置、凭据或数据卷。独立容器自带 `/backends/cuda12-llama-cpp` 和 `/backends/cuda13-vllm`，运行时不依赖旧部署的后端目录。固定来源见 `config/runtime-lock.json`。
 
-## 给自己的客户端配置
+3. 回到 Windows，在仓库目录中建立自己的后端。`--asset-root` 可重复指定，目录中的文件只读挂载；登记模型时选择这些目录内的文件或模型目录。省略时使用数据目录下的 `models`。
 
-程序运行时，默认地址如下。凭据从“接入与测试”页复制，不要把云厂商原始 Key 当成 AIToolbox 调用凭据。
+   ```powershell
+   python tools/localai.py start --distribution Ubuntu --asset-root "D:\MyModels"
+   python src/main.py
+   ```
 
-| 用途 | Base URL |
+   使用自选数据目录时，上述两个命令都添加 `--data-dir "D:\MyAIToolboxData"`。准备工具生成独立密钥、配置和容器，不导入旧部署的厂商或模型。后续可用同一工具的 `status` / `stop` 操作查看或停止自己的后端；执行前关闭桌面程序。新增模型根时，需要在关闭程序后停止并移除提示中准确命名的自有容器，再重新 `start`；数据和权重保留在宿主机。
+
+首次启动默认使用 `%LOCALAPPDATA%\AIToolbox`。窗口仍有“云厂商”“本地模型管理”“用量”“接入与测试”四页。后端未准备时，本地健康检查或登记返回错误；云厂商配置与历史用量仍可使用。
+
+## 模型登记与生命周期
+
+在“本地模型管理”选择 GGUF 文件及需要的多模态投影，或选择含 `config.json`、safetensors 的模型目录。勾选真实输入能力，填写实例总上下文 `max_context_tokens`；文本输出必选，文本输入可不选，因此可登记只接受音频的 ASR 或只接受图片的 OCR。支持范围以对应后端和真实能力验证为准，不能把“发现文件”当作可用。
+
+登记会真实加载、验证所选能力并取得原生资源画像，成功才进入 `READY`；验证结束释放测试实例。调用时按需加载，最后一个使用者结束后卸载。`READY` 表示验证过的绑定，并不表示一直占用显卡。修改先排空旧请求、验证新绑定，失败保留原配置；取消登记停止接新请求、排空并释放实例，不删除模型文件或历史结果。相同 ID 重新登记建立新修订。
+
+旧 CPU 版使用原数据目录升级时，云厂商、DPAPI 凭据、调用 token、收据和数据库保留。旧 CPU `READY` 会显示 `legacy_cpu_registration_requires_update`，请选中模型后点“修改注册”，用现有字段重新验证；成功后形成新修订。不会在启动时偷偷加载旧模型、重放请求，或把旧运行时的证明当作 V11 验证结果。
+
+## 两层资源安排
+
+第一层按登记的模型、精度、**完整实例总上下文 T** 计算显存占位，从大到小尝试；大项放不下仍继续检查小项。同模型先复用已有实例，需要且能放下时再建副本。并发实例数由实际预算决定，不固定为 1 或 4，也不缩小 T 或降低精度来凑空间。
+
+第二层扫描完整批次，同模型请求即使被其他模型隔开，也继续向后收集。实例内部按到达顺序检查可放入的请求；暂时放不下的等待，后面能放下的可以先执行。例如剩余 3000，先来的 4000 等待，后来的 2000 可以进入。
+
+每条请求预留它声明的完整 `context_tokens = C`；多候选 `n` 占用 `C × n`。原生实际输入计数只用于核对“输入 + 最大输出 ≤ C”，输入短不会少占 C。T 是实例总池，C 是本次请求的完整额度，`max_tokens` / `max_completion_tokens` 是最大输出，三者不能互换。
+
+## 接口与批次
+
+| 用途 | 默认地址 |
 | --- | --- |
 | 自定义云厂商 | `http://127.0.0.1:49777/p/<厂商标识>/v1` |
-| 本地已注册模型 | `http://127.0.0.1:49778/v1` |
+| 本地模型 | `http://127.0.0.1:49778/v1` |
+| 私有 LocalAI 后端 | `http://127.0.0.1:49779`，由产品内部使用 |
 
-Anthropic 客户端若自行追加 `/v1/messages`，Base URL 填云端地址去掉末尾 `/v1`。两个入口使用各自的调用凭据。默认仅接受本机访问，不是公网服务器。
+客户端从“接入与测试”复制相应入口的调用凭据，发送 `Authorization: Bearer <凭据>`；不要使用云厂商原始 Key 或后端密钥代替。各端口仅绑定本机。`settings.json` 的 `cloud_port` / `local_port` 可在关闭应用后修改；后端端口通过准备工具 `--port` 设置，不能与客户端端口重叠。
 
-调用前用 `GET /v1/models` 查询目录。本地 Chat Completions 示例正文：
+本地 `GET /v1/models` 查询已就绪模型；`POST /v1/chat/completions` 示例：
+
+```json
+{"model":"my-model","messages":[{"role":"user","content":"你好"}],"context_tokens":2048,"max_tokens":128}
+```
+
+支持文本、所登记的图像/音频输入、流式响应和多候选。`POST /v1/audio/transcriptions` 使用 multipart 的 `model`、WAV `file`、`context_tokens`、`max_tokens`；当前不提供音频生成。
+
+需表达请求关联时，向 `POST /v1/batches` 提交一次完整、不可变的有序清单（目前只接受非流式 Chat Completions 正文）：
 
 ```json
 {
-  "model": "你注册的模型ID",
-  "messages": [{"role": "user", "content": "你好"}],
-  "context_tokens": 2048,
-  "max_tokens": 128
+  "object_id":"document-1",
+  "batch_id":"round-1",
+  "requests":[
+    {"request_id":"A1","body":{"model":"A","messages":[{"role":"user","content":"第一段"}],"context_tokens":2048,"max_tokens":128}},
+    {"request_id":"A2","body":{"model":"A","messages":[{"role":"user","content":"第二段"}],"context_tokens":2048,"max_tokens":128}},
+    {"request_id":"B1","body":{"model":"B","messages":[{"role":"user","content":"另一模型"}],"context_tokens":2048,"max_tokens":128}},
+    {"request_id":"A3","body":{"model":"A","messages":[{"role":"user","content":"下一连续段"}],"context_tokens":2048,"max_tokens":128}}
+  ]
 }
 ```
 
-POST 到本地 `/v1/chat/completions`，携带 `Authorization: Bearer <本地调用凭据>`。文字生成每次必须填写正整数 `context_tokens` 和 `max_tokens` 或 `max_completion_tokens`。注册时的 `max_context_tokens` 是模型实例总容量；同时调用按各自声明的 `context_tokens` 预留，累计不超过总容量，暂时放不下时等待。服务还会核对真实输入 token 加请求输出上限能否放进本次声明额度。注册总量至少 512 token，实际可用值受模型和本机内存限制。支持 `stream: true`。音频转写使用 `/v1/audio/transcriptions`，multipart 字段包含 `model`、`file`、`context_tokens` 和 `max_tokens`，需先启用音频输入能力。
+返回批次 `key`，用 `GET /v1/batches/<key>` 查询。在上述原顺序中，资源安排可以收集 A1、A2、A3；但 A1 有原生证据的超限只传播到同一连续段的 A2。已运行的相关请求会收到定向停止并记录原生确认；B1、A3、其他对象/批次继续，已完成结果保留。生成前拒绝不算这套处理已经完成。**对象、批次和原序共同确定关联范围，单个请求 ID 只负责该请求身份。**
 
-AI 也可用同一本地凭据管理模型：`POST /admin/models` 提交 `id`、`model_path`、可选 `mmproj_path`、`capabilities` 和 `max_context_tokens`；`GET /admin/models/<id>` 查看状态；`PATCH /admin/models/<id>` 带 `expected_revision` 修改总量、路径、投影文件或能力；`DELETE /admin/models/<id>` 取消注册。修改会等待旧请求结束并验证新配置，失败时保留原配置。能力名为 `text_input`、`image_input`、`audio_input`、`text_output`，当前必须包含文本输入/输出。不支持音频生成。
+模型管理：`POST /admin/models` 登记；`GET /admin/models/<id>` 查询；`PATCH /admin/models/<id>` 带 `expected_revision` 修改；`DELETE /admin/models/<id>` 排空并注销。登记字段为 `id`、绝对 `model_path`、可选 `mmproj_path`、`capabilities`、`max_context_tokens`。`GET /admin/scheduling` 查看实例、完整额度占用与安排事件。
 
-## 查询结果与用量
+## 云厂商、结果与数据
 
-保存响应头里的 `X-AIToolbox-Request-ID`，也可以在请求时自行提供 `X-Request-Id`。在相应的云端或本地端口上：
+厂商配置由使用者填写。标识以小写英文开头，可含数字、下划线和横线；API 根地址一般以 `/v1` 结尾，外网需 HTTPS、本机可 HTTP。OpenAI 兼容使用 Bearer；Anthropic 使用 `x-api-key` 和 `anthropic-version`；其他接口可使用 `api-key`。按厂商原协议转发，不自动转换 Chat Completions、Responses、Messages。Anthropic 客户端若自行追加 `/v1/messages`，Base URL 去掉末尾 `/v1`。模型目录是用户填写的提示，实际权限以厂商响应为准。
 
-- `GET /requests/<id>`：查询持久记录；需要原入口凭据。
-- 云端 `GET /requests/<id>/result`：读取已完成的原始响应正文。流式结果保留原 SSE 数据。
-- 本地查询记录中的 `response.body_base64` 保存完整响应正文，`usage` 保存上游返回的计量。
-- 本地 `GET /admin/usage-dashboard?day=YYYY-MM-DD`：查询同一业务数据库的云端和本地日用量，按北京时间。
+保存响应头 `X-AIToolbox-Request-ID` 或自行提供 `X-Request-ID`。在原入口 `GET /requests/<id>` 查询持久收据；云端 `/requests/<id>/result` 返回原响应，流式保留 SSE；本地收据 `response.body_base64` 保存完整正文。断线先查原 ID；已受理同 ID 不再次调用，`UNKNOWN` 不能当成功或盲目重发。用量来自原生返回，未知不估算，本地约 5 秒后同步到业务数据库。
 
-断线或超时后先查询原 ID。`UNKNOWN` 表示无法确认完整终态，不能当作成功，也不要盲目重发。已受理的同 ID 请求不会自动再次调用模型。用量未知时保持未知；本地用量最多约 5 秒后出现在图表。
+关闭窗口停止新调用、排空已受理工作、保存记录并释放模型；独立 LocalAI 容器可保持空闲，用准备工具 `stop` 停止。备份前关闭应用并停止自己的后端，复制完整数据目录。密钥使用当前 Windows 用户的 DPAPI；换电脑或用户通常需重填云厂商 Key。不要上传使用后的数据目录。
 
-## 你的数据存在哪里
+## 构建与验证范围
 
-默认在 `%LOCALAPPDATA%\AIToolbox`，可从界面打开。程序文件夹可以移动，数据默认留在该使用者的数据目录。通过 `AIToolbox.exe --data-dir "自选目录"` 可以使用另一套独立数据。
-
-密钥由当前 Windows 用户的 DPAPI 加密；调用凭据只在本机数据目录保存。数据库和收据保存请求输入、输出、状态与用量。备份时先关闭窗口，再复制整个数据目录；复制到另一台机器或另一个 Windows 用户后，通常需要重新填写厂商密钥。不要把使用后的数据目录发给别人或上传 GitHub。
-
-关闭窗口会停止接受新调用，等待当前调用和后台注册验证结束、保存记录并停止本产品服务。再次启动恢复目录和记录，不自动加载模型或重发中断请求。所有已注册模型均按需加载，最后一个调用结束后释放实例；正常响应、失败、断线和记录保存失败都执行释放。正在调用或等待上下文额度时不卸载，切换、修改和取消注册等待安全排空。中断的注册验证需要显式重试，验证成功或失败都会释放测试实例。Windows 进程所有权保护会在父服务异常退出时回收已绑定的自有模型进程。同一数据目录只允许一个实例使用。
-
-模型释放后仍显示 READY，表示已经验证可用，下次调用会重新加载。管理界面的总上下文是可修改的实例容量，8192 不是模型的固定上限；更大容量仍需通过原生能力和物理内存检查。
-
-端口冲突会给出启动错误；在自己的 `settings.json` 修改 `cloud_port` / `local_port` 后重启。没有自动修改系统 PATH、旧客户端或其他 AIToolbox 部署。
-
-## 已知边界
-
-内置推理使用 CPU，一次加载一个模型。较大的权重需要足够可用内存，速度取决于机器与模型；能启动软件不代表任意权重都能运行。产品不附带模型文件、GPU 驱动或 CUDA 库。
-
-音频注册探针由 Windows 在本机临时合成一句自有测试文本，用后删除；没有携带第三方录音。该验证需要 Windows 已安装英语语音。如提示缺少语音，请在 Windows 语言/语音设置安装英语语音后重新注册；文本和图像使用不依赖语音组件。
-
-云调用需要使用者自己的有效账号、余额/权限与网络。目录中的名称是使用者填写的提示，不代表自动购买权限。测试按钮会实际调用所选模型；云端可能计费。
-
-## 开发者：从源码运行和构建
-
-源码使用 Python 3.11 标准库与 Tk，无 pip 运行依赖。Windows 下先准备固定原生运行时，再启动：
-
-```powershell
-python -c "import sys; sys.path.insert(0,'tools'); from build import prepare_runtime; prepare_runtime()"
-python src/main.py
-```
-
-构建独立 Windows 发行包：
+Windows 桌面打包（与上面的后端镜像构建分开）：
 
 ```powershell
 python -m venv .build/venv
 .build/venv/Scripts/python -m pip install -r requirements-build.txt
 .build/venv/Scripts/python tools/build.py
-```
-
-构建脚本下载并核对 `config/runtime-lock.json` 固定版本/哈希，不下载模型。输出为 `dist/AIToolbox/` 和 `dist/AIToolbox-Windows-x64.zip`，随包 `manifest.json` 列出文件 SHA256。构建产物不进入源码 Git。
-
-运行工程检查：
-
-```powershell
 $env:PYTHONPATH = "$PWD/src"
 python -m unittest discover -s tests -v
 ```
 
-自有代码使用 [MIT](LICENSE)。第三方运行组件按[各自许可](THIRD_PARTY_NOTICES.md)分发，不能把权重、云服务或其他用户资产的权限从本项目许可证推导出来。
+输出 `dist/AIToolbox/`、`dist/AIToolbox-Windows-x64.zip` 和 SHA256 清单。桌面包包含 Python/Tk，不再包含旧 CPU llama-server；后端工具脚本仍需 Python，WSL 镜像构建需要 Python 3。完整保留 `_internal` 和配套资源。
 
-本目录是 v10.3.0 源码。已从本源码构建 Windows 测试包、核对文件哈希，并从重新解压的 ZIP 在全新数据目录中空白启动；隔离的 0.8B 模型已登记为 `READY`，一次文字请求和原 ID 收据均完成并记录实际用量。用户独立验收尚未开始。**对外公开分发二进制前，还需确认微软运行库的再分发授权**；附上条款不等于取得该授权。待上传源码不含这些 DLL，详见上述第三方说明。
+迁移后的独立源码通过 60 项工程检查，Windows 打包程序完成空白启动与 22 条真实请求：文本生命周期、三个实例并发、新 ASR/OCR 登记、7 条贪婪安排/完整额度补位，以及原连续段定向停止。调度文件、批次受理/请求执行和原生补丁与 V11.7 基线一致，6 个已部署原生二进制/适配器哈希完全相同。V11.7 的 Omni 兼容证据作为继承基线保留。原生上下文溢出和显存 OOM 未主动制造，Omni 小字 OCR 质量限制保留。新的公开干净构建配方与“完整迁移已验证的后端”是不同验证范围，不能把后者当作所有新机器从零安装都验证过。
+
+音频能力探针沿用独立版的自有文本，通过 Windows 英语语音临时合成，用后删除；不携带第三方录音。缺少英语语音时须安装后重试。自有代码使用 [MIT](LICENSE)，第三方来源及分发边界见[许可说明](THIRD_PARTY_NOTICES.md)。

@@ -1,0 +1,121 @@
+--- a/core/http/endpoints/openai/inference.go
++++ b/core/http/endpoints/openai/inference.go
+@@ -109,9 +109,11 @@
+ 	tokenUsage := backend.TokenUsage{}
+ 	var allChatDeltas []*pb.ChatDelta
+ 
+-	const maxRetries = 5
+-
+-	for range n {
++	maxRetries := 5
++	preparedCall := req.Metadata["aitoolbox_phase"] == "execute"
++	if preparedCall { maxRetries = 0 }
++
++	for choiceIndex := range n {
+ 		var prediction backend.LLMResponse
+ 
+ 		for attempt := 0; attempt <= maxRetries; attempt++ {
+@@ -150,15 +152,36 @@
+ 				}
+ 			}
+ 
++			if preparedCall {
++				tokenUsage.Prompt += prediction.Usage.Prompt
++				tokenUsage.Completion += prediction.Usage.Completion
++				tokenUsage.TimingPromptProcessing += prediction.Usage.TimingPromptProcessing
++				tokenUsage.TimingTokenGeneration += prediction.Usage.TimingTokenGeneration
++			} else {
+ 			tokenUsage.Prompt = prediction.Usage.Prompt
+ 			tokenUsage.Completion = prediction.Usage.Completion
+ 			tokenUsage.TimingPromptProcessing = prediction.Usage.TimingPromptProcessing
+ 			tokenUsage.TimingTokenGeneration = prediction.Usage.TimingTokenGeneration
++			}
+ 
+ 			allChatDeltas = prediction.ChatDeltas
+ 
+ 			finetunedResponse := backend.Finetune(*config, predInput, prediction.Response)
++			before := len(result)
+ 			cb(finetunedResponse, &result)
++			if preparedCall {
++				if n > 1 {
++					parsed := applyAutoparserOverride(prediction.ChatDeltas, "", config.ReasoningConfig, result[before:])
++					result = append(result[:before], parsed...)
++				}
++				for i := before; i < len(result); i++ {
++					result[i].Index = choiceIndex
++					if reachedTokenBudget(prediction.Usage.Completion, config.Maxtokens) && result[i].FinishReason != nil && *result[i].FinishReason == FinishReasonStop {
++						reason := FinishReasonLength
++						result[i].FinishReason = &reason
++					}
++				}
++			}
+ 
+ 			// Caller-driven retry (tool parsing, reasoning-only, etc.).
+ 			// When the C++ autoparser is active, it may deliver parsed data
+--- a/core/http/endpoints/openai/chat.go
++++ b/core/http/endpoints/openai/chat.go
+@@ -172,7 +172,7 @@
+ 	reasoningConfig reason.Config,
+ 	existing []schema.Choice,
+ ) []schema.Choice {
+-	if len(chatDeltas) == 0 {
++	if len(chatDeltas) == 0 || len(existing) > 1 {
+ 		return existing
+ 	}
+ 	deltaContent := functions.ContentFromChatDeltas(chatDeltas)
+@@ -1117,7 +1117,7 @@
+ 				// If generation hit the max_tokens ceiling, report "length"
+ 				// instead of a natural "stop" (issue #9716). Mirrors the
+ 				// streaming path; tool/function finish reasons are untouched.
+-				if reachedTokenBudget(tokenUsage.Completion, config.Maxtokens) {
++				if input.N <= 1 && reachedTokenBudget(tokenUsage.Completion, config.Maxtokens) {
+ 					for i := range result {
+ 						if result[i].FinishReason != nil && *result[i].FinishReason == FinishReasonStop {
+ 							lengthReason := FinishReasonLength
+--- a/core/http/endpoints/openai/inference_test.go
++++ b/core/http/endpoints/openai/inference_test.go
+@@ -76,6 +76,44 @@
+ 		}
+ 	}
+ 
++	It("keeps prepared choices, individual limits and total native usage", func() {
++		mockInference([]backend.LLMResponse{
++			{Response: "first", Usage: backend.TokenUsage{Prompt: 10, Completion: 2}},
++			{Response: "second", Usage: backend.TokenUsage{Prompt: 10, Completion: 3}, ChatDeltas: []*pb.ChatDelta{{Content: "second", ReasoningContent: "reason"}}},
++		})
++		req := makeReq()
++		req.N = 2
++		req.Metadata = map[string]string{"aitoolbox_phase": "execute"}
++		limit := 3
++		cfg.Maxtokens = &limit
++		choices, usage, deltas, err := ComputeChoices(req, "prompt", cfg, nil, appCfg, nil,
++			func(s string, out *[]schema.Choice) {
++				reason := FinishReasonStop
++				*out = append(*out, schema.Choice{Message: &schema.Message{Content: s}, FinishReason: &reason})
++			}, nil)
++		Expect(err).ToNot(HaveOccurred())
++		choices = applyAutoparserOverride(deltas, "", cfg.ReasoningConfig, choices)
++		Expect(choices).To(HaveLen(2))
++		Expect(choices[0].Index).To(Equal(0))
++		Expect(choices[1].Index).To(Equal(1))
++		Expect(choices[0].Message.Content).To(Equal("first"))
++		Expect(choices[1].Message.Content).To(HaveValue(Equal("second")))
++		Expect(choices[1].Message.Reasoning).To(HaveValue(Equal("reason")))
++		Expect(*choices[0].FinishReason).To(Equal(FinishReasonStop))
++		Expect(*choices[1].FinishReason).To(Equal(FinishReasonLength))
++		Expect(usage.Prompt).To(Equal(20))
++		Expect(usage.Completion).To(Equal(5))
++	})
++	It("never regenerates an empty prepared result", func() {
++		mockInference([]backend.LLMResponse{{Response: ""}, {Response: "unwanted retry"}})
++		req := makeReq()
++		req.Metadata = map[string]string{"aitoolbox_phase": "execute"}
++		choices, _, _, err := ComputeChoices(req, "prompt", cfg, nil, appCfg, nil,
++			func(s string, out *[]schema.Choice) { *out = append(*out, schema.Choice{Text: s}) }, nil)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(choices).To(HaveLen(1))
++		Expect(choices[0].Text).To(Equal(""))
++	})
+ 	Context("normal response (no retry needed)", func() {
+ 		It("should return choices on first attempt", func() {
+ 			mockInference([]backend.LLMResponse{

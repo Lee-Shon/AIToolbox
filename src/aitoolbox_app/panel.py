@@ -307,18 +307,21 @@ class Panel:
         self.model_rows = {}
         self.selected_model_id = None
         self.updating_model_id = None
+        self.text_input = tk.BooleanVar(value=True)
         self.image = tk.BooleanVar(value=False)
         self.audio = tk.BooleanVar(value=False)
-        fields = (("模型 ID", self.model_id), ("权重文件", self.model_path),
+        fields = (("模型 ID", self.model_id), ("GGUF 文件或模型目录", self.model_path),
                   ("多模态投影文件", self.mmproj_path), ("实例总上下文 (token)", self.context))
         for row, (label, variable) in enumerate(fields):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
             ttk.Entry(form, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Button(form, text="浏览…", command=lambda: self.browse(self.model_path)).grid(row=1, column=2, padx=(8, 0))
+        ttk.Button(form, text="GGUF…", command=lambda: self.browse(self.model_path)).grid(row=1, column=2, padx=(8, 0))
+        ttk.Button(form, text="目录…", command=lambda: self.model_path.set(filedialog.askdirectory(parent=self.root) or self.model_path.get())).grid(row=1, column=3, padx=8)
         ttk.Button(form, text="浏览…", command=lambda: self.browse(self.mmproj_path)).grid(row=2, column=2, padx=(8, 0))
         options = ttk.Frame(form)
         options.grid(row=4, column=1, sticky="w", pady=(6, 4))
-        ttk.Label(options, text="文本输入/输出已包含；额外启用：").pack(side="left")
+        ttk.Label(options, text="文本输出已包含；选择输入能力：").pack(side="left")
+        ttk.Checkbutton(options, text="文本输入", variable=self.text_input).pack(side="left")
         ttk.Checkbutton(options, text="图片输入", variable=self.image).pack(side="left", padx=8)
         ttk.Checkbutton(options, text="语音输入", variable=self.audio).pack(side="left", padx=8)
         actions = ttk.Frame(form)
@@ -361,10 +364,10 @@ class Panel:
         if not model_id or not model_path:
             self.message.set("请填写模型 ID 和权重文件")
             return
-        if (self.image.get() or self.audio.get()) and not mmproj_path:
+        if Path(model_path).is_file() and (self.image.get() or self.audio.get()) and not mmproj_path:
             self.message.set("图片或语音输入需要多模态投影文件")
             return
-        capabilities = ["text_input", "text_output"]
+        capabilities = ["text_output"] + (["text_input"] if self.text_input.get() else [])
         if self.image.get():
             capabilities.append("image_input")
         if self.audio.get():
@@ -393,7 +396,7 @@ class Panel:
             payload = {"max_context_tokens": int(self.context.get().strip()),
                        "model_path": self.model_path.get().strip(),
                        "mmproj_path": self.mmproj_path.get().strip() or None,
-                       "capabilities": ["text_input", "text_output"] +
+                       "capabilities": ["text_output"] + (["text_input"] if self.text_input.get() else []) +
                                        (["image_input"] if self.image.get() else []) +
                                        (["audio_input"] if self.audio.get() else []),
                        "expected_revision": self.model_rows[model_id]["revision"]}
@@ -453,6 +456,7 @@ class Panel:
             self.context.set(str(settings.get("max_context_tokens", 8192)))
             self.model_path.set(settings.get("model_path", ""))
             self.mmproj_path.set(settings.get("mmproj_path") or "")
+            self.text_input.set("text_input" in settings.get("capabilities", []))
             self.image.set("image_input" in settings.get("capabilities", []))
             self.audio.set("audio_input" in settings.get("capabilities", []))
 

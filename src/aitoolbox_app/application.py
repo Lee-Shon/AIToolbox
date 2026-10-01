@@ -18,7 +18,8 @@ from cloud_data_capture import Caller, CandidateServer, ManagedFiles, Provider
 from cloud_data_capture.proxy import CandidateHandler
 from cloud_relay.config import load_providers
 from cloud_relay.state import State
-from local_product.service import Product, Server, Handler, save_json
+from local_product.service import Server, save_json
+from local_product.v11 import LocalAIClient, LocalAIProduct, V11Handler
 from . import __version__
 
 PROJECT = "aitoolbox"
@@ -80,7 +81,7 @@ class CloudHandler(CandidateHandler):
                 app.requests.notify_all()
 
 
-class LocalHandler(Handler):
+class LocalHandler(V11Handler):
     def _handle(self):
         app = self.server.app
         with app.requests:
@@ -95,7 +96,7 @@ class LocalHandler(Handler):
 
 class Application:
     def __init__(self, data_root: Path, *, cloud_port: int | None = None,
-                 local_port: int | None = None, executable: Path | None = None):
+                 local_port: int | None = None):
         self.root = data_root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.servers = []
@@ -119,7 +120,7 @@ class Application:
             self._owner.close()
             raise RuntimeError("AIToolbox 已在使用这个数据目录，请回到已打开的窗口。") from exc
         try:
-            self._start(cloud_port, local_port, executable)
+            self._start(cloud_port, local_port)
         except BaseException:
             self.close()
             raise
@@ -141,7 +142,7 @@ class Application:
             raise ValueError("调用凭据文件不完整：" + name)
         return value
 
-    def _start(self, cloud_port, local_port, executable):
+    def _start(self, cloud_port, local_port):
         runtime = self.root / "runtime"
         self.security = runtime / "security"
         self.security.mkdir(parents=True, exist_ok=True)
@@ -186,9 +187,19 @@ class Application:
         self.cloud.app = self
         self.cloud.RequestHandlerClass = CloudHandler
         self._serve(self.cloud)
-        executable = executable or resource_root() / "runtime" / "llama" / "llama-server.exe"
-        self.product = Product(runtime / "local-product", executable, data_url, self.security / "data-admin.token")
-        self.local = Server(("127.0.0.1", local_port), self.product)
+        # Use the same V11 service as the main deployment, with this user's
+        # own backend, key, asset mounts and data service.
+        self._token("localai-api.key")
+        assets = self.root / "models"
+        assets.mkdir(exist_ok=True)
+        backend = settings.get("localai", {})
+        mounts = backend.get("asset_mounts", [{"host": str(assets), "target": "/models/assets-user"}])
+        client = LocalAIClient(backend.get("url", "http://127.0.0.1:49779"),
+                               self.security / "localai-api.key")
+        self.product = LocalAIProduct(runtime / "local-product", data_url,
+            self.security / "data-admin.token", client,
+            [(Path(item["host"]), item["target"]) for item in mounts])
+        self.local = Server(("127.0.0.1", local_port), self.product, LocalHandler)
         self.local.app = self
         self.local.RequestHandlerClass = LocalHandler
         self._serve(self.local)

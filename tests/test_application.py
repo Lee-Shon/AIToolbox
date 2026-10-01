@@ -43,7 +43,7 @@ class Integration(unittest.TestCase):
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
         self.thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
         self.thread.start()
-        self.app = Application(self.root, cloud_port=0, local_port=0, executable=Path(sys.executable))
+        self.app = Application(self.root, cloud_port=0, local_port=0)
         self.token = self.app.cloud_token_path.read_text()
         Upstream.calls = 0
 
@@ -72,12 +72,12 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.app.product.list_ready(), [])
         self.assertEqual(self.app.product.database_usage_day("2026-09-28"), {"day": "2026-09-28", "cloud": [], "local": []})
         with self.assertRaises(RuntimeError):
-            Application(self.root, cloud_port=0, local_port=0, executable=Path(sys.executable))
+            Application(self.root, cloud_port=0, local_port=0)
         with self.assertRaises(HTTPError) as failure:
             self.request("/p/custom/v1/models", token="invalid")
         self.assertEqual(failure.exception.code, 401)
         self.app.close()
-        self.app = Application(self.root, cloud_port=0, local_port=0, executable=Path(sys.executable))
+        self.app = Application(self.root, cloud_port=0, local_port=0)
         self.assertEqual(self.app.cloud_token_path.read_text(), self.token)
 
     def test_custom_provider_capture_idempotence_and_restart(self):
@@ -96,7 +96,7 @@ class Integration(unittest.TestCase):
         day = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
         self.assertEqual(self.app.product.database_usage_day(day)["cloud"][0]["input_tokens"], 3)
         self.app.close()
-        self.app = Application(self.root, cloud_port=0, local_port=0, executable=Path(sys.executable))
+        self.app = Application(self.root, cloud_port=0, local_port=0)
         self.assertEqual(json.loads(self.request("/requests/original/result")), response)
         self.assertEqual(Upstream.calls, 1)
 
